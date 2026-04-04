@@ -21,7 +21,7 @@ def main() -> None:
         "--stat-port",
         type=int,
         default=5610,
-        help="UDP port for sidecar stat packets (default: 5610)",
+        help="UDP port to listen for incoming packets (default: 5610)",
     )
     run_p.add_argument(
         "--wfb-host",
@@ -47,6 +47,25 @@ def main() -> None:
         "--dry-run",
         action="store_true",
         help="Log updates without sending to wfb_tx",
+    )
+
+    # Sidecar mode options
+    run_p.add_argument(
+        "--sidecar-host",
+        default="",
+        help="Venc sidecar host to subscribe to (e.g. 10.0.0.1). "
+             "If set, sends SUBSCRIBE messages to keep subscription alive.",
+    )
+    run_p.add_argument(
+        "--sidecar-port",
+        type=int,
+        default=6666,
+        help="Venc sidecar UDP port (default: 6666)",
+    )
+    run_p.add_argument(
+        "--legacy-stat",
+        action="store_true",
+        help="Use legacy 8-byte stat packets instead of sidecar FRAME messages",
     )
 
     # --- simulate ---
@@ -76,6 +95,9 @@ def main() -> None:
             wfb_control_host=args.wfb_host,
             wfb_control_port=args.wfb_port,
             dry_run=args.dry_run,
+            sidecar_mode=not args.legacy_stat,
+            sidecar_host=args.sidecar_host,
+            sidecar_port=args.sidecar_port,
         )
         asyncio.run(service.run())
     elif args.cmd == "simulate":
