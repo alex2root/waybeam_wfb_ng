@@ -10,6 +10,7 @@ from fec_controller.simulation import simulate_stream, print_reference_table
 from fec_controller.benchmark import run_all, replay
 from fec_controller.payload_benchmark import (
     BenchmarkConfig as PayloadBenchmarkConfig,
+    LinkBudgetProfile,
     compare_policies,
     format_report,
 )
@@ -102,6 +103,15 @@ def main() -> None:
         "--ramp-to", type=int, default=0,
         help="Post-ramp frame size in bytes; requires --ramp-at > 0.",
     )
+    pb_p.add_argument(
+        "--budget-schedule",
+        type=str,
+        default="",
+        help=(
+            "Comma-separated schedule of pps_budget changes, e.g. "
+            "'0:3000,2:600,4:3000'. Overrides --pps-budget per frame."
+        ),
+    )
     pb_p.add_argument("--seed", type=int, default=0xC0FFEE)
 
     # --- benchmark ---
@@ -165,12 +175,25 @@ def main() -> None:
             jitter_sigma=args.jitter,
             bitrate_events=events,
         )
+        budget_profile = LinkBudgetProfile()
+        if args.budget_schedule:
+            try:
+                for token in args.budget_schedule.split(","):
+                    t_str, pps_str = token.strip().split(":")
+                    budget_profile.events.append(
+                        (float(t_str), float(pps_str))
+                    )
+            except (ValueError, IndexError) as exc:
+                parser.error(
+                    f"--budget-schedule must be 't:pps,t:pps,...' — {exc}"
+                )
         cfg = PayloadBenchmarkConfig(
             fps=args.fps,
             frames=args.frames,
             fec_k=args.fec_k,
             profile=profile,
             pps_budget=args.pps_budget,
+            budget_profile=budget_profile,
             min_payload=args.min_payload,
             fixed_payload=args.fixed_payload,
             mtu_override=args.mtu_override,

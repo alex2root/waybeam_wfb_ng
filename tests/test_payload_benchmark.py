@@ -3,6 +3,7 @@
 from fec_controller.encoder_sim import SizeProfile
 from fec_controller.payload_benchmark import (
     BenchmarkConfig,
+    LinkBudgetProfile,
     compare_policies,
     format_report,
 )
@@ -89,6 +90,90 @@ def test_variable_steady_state_not_strictly_worse():
     fx = result["fixed"]["one_block_hit_rate"]
     va = result["variable"]["one_block_hit_rate"]
     assert va >= fx - 0.05, f"variable={va:.2%} fixed={fx:.2%}"
+
+
+def test_link_budget_profile_empty_uses_fallback():
+    """Empty schedule -> every query returns the fallback."""
+    p = LinkBudgetProfile()
+    assert p.value_at(0.0, 1500.0) == 1500.0
+    assert p.value_at(10.0, 1500.0) == 1500.0
+
+
+def test_link_budget_profile_step_function():
+    """Budget steps take effect at their scheduled time and persist."""
+    p = LinkBudgetProfile(events=[(0.0, 3000.0), (2.0, 600.0), (4.0, 3000.0)])
+    assert p.value_at(-0.1, 1500.0) == 1500.0  # before any event -> fallback
+    assert p.value_at(0.0, 1500.0) == 3000.0
+    assert p.value_at(1.9, 1500.0) == 3000.0
+    assert p.value_at(2.0, 1500.0) == 600.0
+    assert p.value_at(3.5, 1500.0) == 600.0
+    assert p.value_at(4.0, 1500.0) == 3000.0
+    assert p.value_at(10.0, 1500.0) == 3000.0
+
+
+def test_variable_responds_to_mid_stream_budget_drop():
+    """When pps_budget collapses mid-stream (MCS drop), variable should
+    grow payload to stay within the new packet budget.
+
+    Scenario tuned so the pre-drop raw payload is above min_payload
+    (otherwise the floor hides the sizer's response).
+    """
+    cfg = BenchmarkConfig(
+        fps=60,
+        frames=360,   # 6 s
+        fec_k=16,
+        profile=SizeProfile(base=14_000, i_mult=1.0, jitter_sigma=0.02),
+        pps_budget=3000.0,
+        # Budget drops to 600 pps at t=2s, recovers at t=4s.
+        budget_profile=LinkBudgetProfile(events=[
+            (0.0, 3000.0),
+            (2.0, 600.0),
+            (4.0, 3000.0),
+        ]),
+        fixed_payload=1500,
+        mtu_override=3000,
+    )
+    from fec_controller.payload_benchmark import _run_variable
+    stats = _run_variable(cfg)
+    pre_drop = [r["payload"] for r in stats.per_frame if r["time_s"] < 1.9]
+    during = [r["payload"] for r in stats.per_frame if 2.8 < r["time_s"] < 3.9]
+    assert len(pre_drop) > 30 and len(during) > 30
+    avg_pre = sum(pre_drop) / len(pre_drop)
+    avg_during = sum(during) / len(during)
+    # budget_pf drops 50 -> 10, so target_pf: min(50,16)=16 -> min(10,16)=10
+    # with S_ref ~= 14000, raw goes 875 -> 1400
+    assert avg_during > avg_pre * 1.3, (
+        f"payload did not grow enough under tighter budget "
+        f"(pre={avg_pre:.0f}, during={avg_during:.0f})"
+    )
+
+
+def test_variable_recovers_after_budget_restore():
+    """When the budget comes back after a dip, payload should fall back
+    toward its pre-dip value once hysteresis releases."""
+    cfg = BenchmarkConfig(
+        fps=60,
+        frames=480,   # 8 s, enough for post-recovery settling
+        fec_k=16,
+        profile=SizeProfile(base=14_000, i_mult=1.0, jitter_sigma=0.02),
+        pps_budget=3000.0,
+        budget_profile=LinkBudgetProfile(events=[
+            (0.0, 3000.0),
+            (2.0, 600.0),
+            (4.0, 3000.0),
+        ]),
+        fixed_payload=1500,
+        mtu_override=3000,
+    )
+    from fec_controller.payload_benchmark import _run_variable
+    stats = _run_variable(cfg)
+    during = [r["payload"] for r in stats.per_frame if 2.8 < r["time_s"] < 3.9]
+    post = [r["payload"] for r in stats.per_frame if r["time_s"] > 6.0]
+    avg_during = sum(during) / len(during)
+    avg_post = sum(post) / len(post)
+    assert avg_post < avg_during * 0.9, (
+        f"payload did not recover (during={avg_during:.0f}, post={avg_post:.0f})"
+    )
 
 
 def test_format_report_renders():

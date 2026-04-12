@@ -118,6 +118,31 @@ def _volatility(xs: list) -> float:
 
 
 @dataclass
+class LinkBudgetProfile:
+    """Schedule of pps_budget changes over time.
+
+    Each entry is (time_s, pps). The value in effect at simulated time
+    `t` is the last entry whose time is <= t. An empty schedule means
+    "always use the static pps_budget from BenchmarkConfig".
+
+    The LinkBudgetEstimator in the sim is fed from this schedule every
+    frame so its freshness TTL, window, and hysteresis all exercise.
+    """
+    events: list[tuple[float, float]] = field(default_factory=list)
+
+    def value_at(self, t: float, fallback: float) -> float:
+        if not self.events:
+            return fallback
+        current = fallback
+        for ev_t, ev_pps in self.events:
+            if ev_t <= t:
+                current = ev_pps
+            else:
+                break
+        return current
+
+
+@dataclass
 class BenchmarkConfig:
     fps: int = 120
     frames: int = 600
@@ -125,6 +150,9 @@ class BenchmarkConfig:
     redundancy: float = 0.33
     profile: SizeProfile = field(default_factory=SizeProfile)
     pps_budget: float | None = 3000.0  # static budget; None = fallback
+    # Optional schedule of pps_budget changes over time. Overrides the
+    # static pps_budget for each frame's simulated time.
+    budget_profile: LinkBudgetProfile = field(default_factory=LinkBudgetProfile)
     min_payload: int = DEFAULT_MIN_PAYLOAD
     mtu_override: int = DEFAULT_MTU_OVERRIDE
     # "Fixed" represents the status-quo packetiser configuration. Real
@@ -171,23 +199,28 @@ def _run_variable(cfg: BenchmarkConfig) -> PolicyStats:
         fallback=float(cfg.profile.base),
         time_fn=lambda: sim_time[0],
     )
+    static_budget = float(cfg.pps_budget) if cfg.pps_budget else 1500.0
     budget = LinkBudgetEstimator(
         window_s=1.0,
         ttl_s=2.0,
-        fallback=float(cfg.pps_budget) if cfg.pps_budget else 1500.0,
+        fallback=static_budget,
         time_fn=lambda: sim_time[0],
     )
-    if cfg.pps_budget:
-        budget.observe(cfg.pps_budget)
+    # Seed with the static/initial value so `is_fresh()` returns True
+    # immediately on first query.
+    initial_budget = cfg.budget_profile.value_at(0.0, static_budget)
+    budget.observe(initial_budget)
 
     stats = PolicyStats(name="variable")
     prev_payload: int | None = None
 
     for _ in range(cfg.frames):
         sim_time[0] += 1.0 / cfg.fps
-        # Re-seed the budget so it stays fresh throughout the run
-        if cfg.pps_budget:
-            budget.observe(cfg.pps_budget)
+        # Drive the estimator from the schedule (or the static value if
+        # no schedule). Doing this every frame keeps the budget fresh and
+        # exercises the rolling window / TTL paths.
+        current_budget = cfg.budget_profile.value_at(sim_time[0], static_budget)
+        budget.observe(current_budget)
 
         # Peek: need a frame size before sizing, but the sizer consumes
         # S_ref from the tracker (updated with PRIOR frames only, so the

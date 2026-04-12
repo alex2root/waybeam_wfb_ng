@@ -43,6 +43,7 @@ from fec_controller.encoder_sim import EncodedFrame, EncoderSim, SizeProfile
 from fec_controller.block_model import BlockStats, make_block, pack_frame_into_blocks
 from fec_controller.payload_benchmark import (
     BenchmarkConfig as PayloadBenchmarkConfig,
+    LinkBudgetProfile,
     PolicyStats,
     compare_policies,
     format_report,
@@ -86,6 +87,7 @@ __all__ = [
     "make_block",
     "pack_frame_into_blocks",
     "PayloadBenchmarkConfig",
+    "LinkBudgetProfile",
     "PolicyStats",
     "compare_policies",
     "format_report",
