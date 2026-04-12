@@ -125,6 +125,17 @@ the benchmark reads both to compute the comparison tables.
 | Padding preferred over spill | `test_sizer_pads_rather_than_spills` |
 | No flap on small drift | `test_sizer_hysteresis_no_flap` |
 | Determinism | `test_sizer_deterministic_under_seed` |
+| Tracks mid-stream MCS drop | `test_variable_responds_to_mid_stream_budget_drop` |
+| Recovers post-MCS-restore | `test_variable_recovers_after_budget_restore` |
+
+## Dynamic link budget in the sim
+
+`LinkBudgetProfile` drives `pps_budget` changes over simulated time via
+a step-function schedule (`[(t, pps), ...]`). The benchmark feeds the
+`LinkBudgetEstimator` on every frame, exercising its rolling window +
+freshness TTL end-to-end. Example: a MCS drop at t=2s then recovery at
+t=4s is expressed as `LinkBudgetProfile(events=[(0, 3000), (2, 600), (4, 3000)])`
+or via the CLI flag `--budget-schedule 0:3000,2:600,4:3000`.
 
 ## Out of scope for this slice
 
