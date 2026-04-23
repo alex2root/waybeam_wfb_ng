@@ -62,3 +62,4 @@ Asymmetric gating — fast increase, slow decrease (mirror of TCP AIMD):
 - Wire protocol must match `rtp_sidecar.h` (network byte order, exact struct sizes)
 - fec_controller is the only sidecar consumer (no multiplexer needed)
 - Loss-rate feedback and dual-stream FEC are out of scope
+- RSSI / link-budget bandwidth scaling is out of scope for now; may be revisited as a separate module later. Keep the FEC block sizer purely driven by sidecar frame info.

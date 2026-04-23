@@ -157,40 +157,6 @@ real sidecar FRAME protocol — no mock formats.
   - [x] Simulation using real protocol path
   - [x] 85 unit/integration tests
 
-### Variable NAL / payload sizing (host-only simulation)
-
-Sibling policy that chooses RTP payload size per frame to keep one
-encoded frame inside one FEC source block, subject to a link
-packets-per-second budget and a configurable `[min_payload, mtu_override]`
-range (hard-capped at 3900 B). See `docs/variable-payload.md` for the
-design note and acceptance criteria.
-
-Components (all in `fec_controller/`):
-
-- `payload_sizer.py` — pure `choose_payload_size()` function; closed-form.
-- `frame_size_percentile.py` — P99-over-window tracker feeding `S_ref`.
-- `link_budget.py` — stub `pps_budget` estimator (real deployment: fed by
-  `mod_aalink` via an extended sidecar message).
-- `encoder_sim.py` — synthetic encoder + packetiser with size/IDR/jitter profile.
-- `block_model.py` — FEC block wire-cost model using wfb-ng's per-block
-  largest-packet padding rule.
-- `payload_benchmark.py` — runs fixed-P vs variable-P over the same trace,
-  reports packet count, wire bytes, padding, one-block hit rate, and
-  policy volatility.
-
-Run the comparison:
-
-```bash
-python -m fec_controller payload-benchmark \
-  --frames 360 --fec-k 8 --base 3000 --ramp-at 1.5 --ramp-to 20000 \
-  --fixed-payload 1500 --mtu-override 3000 --pps-budget 3000
-```
-
-Not yet wired into `FECControllerService` — it's behind the
-`ControllerConfig.enable_variable_payload` flag (default off) until the
-sim justifies migrating the policy. No venc, wfb_tx, or coordination
-repo changes in this slice.
-
 ## Next steps
 
 ### Near-term
@@ -206,3 +172,9 @@ repo changes in this slice.
 - **Packet aggregation on high-MTU links** — When the radio MTU allows
   larger packets, aggregate multiple small RTP packets per FEC symbol to
   reduce FEC overhead. Independent of the adaptive k/n logic.
+
+- **RSSI / link-budget bandwidth scaler** — A separate, opt-in module
+  that could downscale bitrate (or FEC redundancy) when the radio link
+  quality degrades. Intentionally decoupled from the frame-driven FEC
+  block sizer here; will be revisited once the sizer path is stable on
+  hardware.
