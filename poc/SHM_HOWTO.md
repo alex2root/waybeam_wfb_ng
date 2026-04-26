@@ -597,6 +597,189 @@ If modes disagree, RX log will include per-interval:
 N packets dropped (AEAD-mode mismatch, check -x flag on both sides)
 ```
 
+## UDP stats push (`-Y host:port`)
+
+Optional: emit one JSON datagram per `-l` interval to a fixed UDP target.
+Lets external consumers (e.g. `fec_controller`, status WebUI, metrics
+exporter) subscribe to live tx stats without attaching to wfb_tx's stdout
+— so wfb_tx can be supervised independently and multiple consumers can
+read the same stream.
+
+### Usage
+
+```bash
+# Push to fec_controller on the same host
+wfb_tx -K /etc/drone.key -H venc_wfb -k 8 -n 12 -p 0 -B 20 -M 3 \
+       -C 8000 -l 1000 -Y 127.0.0.1:5800 wlan0
+```
+
+Cadence is the existing `-l log_interval` (milliseconds) — the JSON
+emit happens at the same point as the human-readable `PKT` line, so
+both share one clock. The flag is additive: stdout output is unchanged.
+
+Init failures (bad host/port, socket() failure) log once on stderr and
+leave the feature disabled — wfb_tx continues normally. Send errors are
+silently ignored to avoid log spam if the consumer flaps.
+
+### Schema
+
+One datagram per emit, single-line UTF-8 JSON, terminated with `\n` for
+line-oriented tools:
+
+```json
+{"ts_ms":1714115012345,"type":"tx_stats","ver":1,"seq":42,"interval_ms":1000,
+ "tx":{"pkts_in":12345,"bytes_in":456789,
+       "pkts_out":12340,"bytes_out":456000,
+       "pkts_drop":3,"pkts_trunc":2,"fec_timeouts":1,
+       "fec_k":12,"fec_n":20},
+ "radio":{"mcs":3,"bw":20,"short_gi":0,"stbc":0,"ldpc":0,
+          "vht_mode":0,"vht_nss":0}}
+```
+
+| Field | Meaning |
+|---|---|
+| `ts_ms` | Emit timestamp (`get_time_ms()`, monotonic-ish ms). |
+| `seq` | Per-process monotonic counter, starts at 0. Lets consumers detect dropped UDP datagrams (gap > 1) and producer restarts (counter resets). Optional / additive: older wfb_tx emits no `seq` field. |
+| `interval_ms` | The `-l` value at emit time. |
+| `tx.pkts_in` / `bytes_in` | Incoming UDP/SHM packets received this interval. |
+| `tx.pkts_out` / `bytes_out` | Successfully injected (includes FEC parity). |
+| `tx.pkts_drop` | Dropped due to rxq overflow or injection timeout. |
+| `tx.pkts_trunc` | Injected packets that were truncated. |
+| `tx.fec_timeouts` | Empty packets sent to close FEC blocks on `-T fec_timeout`. |
+| `tx.fec_k` / `fec_n` | Current FEC sizes (tracks `wfb_tx_cmd set_fec` writes). |
+| `radio.*` | Current radiotap state. `short_gi`/`ldpc`/`vht_mode` are 0/1. |
+
+`fec_k` / `fec_n` and the entire `radio` block let consumers track
+external `wfb_tx_cmd set_fec` / `set_radio` calls without polling
+`CMD_GET_RADIO` separately.
+
+### Debug
+
+**On-device** (busybox `nc` does NOT support `-u` UDP-listen mode — use
+`socat`, which is preinstalled on OpenIPC):
+
+```bash
+socat -u UDP-RECV:5800,reuseaddr -
+```
+
+**From a host on the same LAN** (point `-Y` at the host IP, then use
+real `nc`):
+
+```bash
+# On vehicle:
+wfb_tx ... -Y 192.168.1.5:5800 ...
+# On host (192.168.1.5):
+nc -ul 5800 | jq -c .
+```
+
+### Versioning
+
+Increment `ver` on incompatible changes. Adding fields without removing
+or renaming existing ones is a non-breaking change (consumers ignore
+unknown keys). Renames or semantics changes bump the version.
+
+### Gotcha — `wfb_tx_cmd set_radio` is whole-struct, not partial
+
+`wfb_tx_cmd ... set_radio` always sends a complete CMD_SET_RADIO struct.
+Any flag you don't pass on the CLI is sent at the **wfb_tx_cmd
+hardcoded default**, NOT preserved from wfb_tx's current state. Defaults
+are: `mcs=1 bw=20 short_gi=0 stbc=0 ldpc=0 vht_mode=0 vht_nss=1`.
+
+So `wfb_tx_cmd 8000 set_radio -M 7` doesn't only "change MCS to 7" —
+it also resets `stbc/ldpc/vht_*` to their defaults, even if you started
+wfb_tx with `-S 1 -L 1`. To preserve, pass everything explicitly:
+
+```bash
+# Right: full restate
+wfb_tx_cmd 8000 set_radio -M 7 -B 20 -G long -S 1 -L 1
+```
+
+Two related footguns:
+
+- **Positional args are silently ignored.** `wfb_tx_cmd 8000 set_radio
+  mcs_index 7` parses as zero flags + two positional args (which
+  getopt drops), then sends a CMD_SET_RADIO with all defaults
+  (mcs=1, stbc=0, ldpc=0, ...). wfb_tx applies it; the operator sees
+  `Radiotap updated with ... mcs_index=1` (NOT 7) but might miss the
+  detail. Always use `-M N` (capital M) for mcs.
+- **The `-Y` stats stream + fec_controller correctly reflect the
+  applied values** (verified on hardware). If your subscriber sees
+  unexpected `radio.*` after a `wfb_tx_cmd set_radio`, double-check
+  the command — wfb_tx's "Radiotap updated with ..." stderr line is
+  the source of truth for what actually got applied.
+
+## UDP stats push for wfb_rx (`-Y host:port`)
+
+Same flag, mirror semantics. Emits one JSON datagram per `-l` interval
+with per-antenna RSSI/SNR plus the same aggregate counters that the
+human-readable `PKT` line carries. Lets ground-side consumers
+(fec_controller via uplink, status WebUI, RSSI overlays) subscribe
+without bridging through `ground_rssi_forwarder.py`.
+
+### Usage
+
+```bash
+# Ground (x86 host with WiFi adapter in monitor mode)
+sudo wfb_rx -K /etc/drone.key -i 207 -p 0 -l 1000 \
+            -Y 127.0.0.1:5801 wlx40a5ef2f229b
+```
+
+### Schema (`type: rx_ant`, ver 1)
+
+One datagram per emit, single line, newline-terminated. The `ant`
+array carries one entry per `(freq, mcs, bw, antenna_id)` key — so
+multi-antenna RX diversity surfaces naturally as multiple entries.
+
+```json
+{"ts_ms":26279557,"type":"rx_ant","ver":1,"seq":2,"interval_ms":1000,
+ "ant":[
+   {"freq":5745,"mcs":5,"bw":20,"id":"1","pkts":2286,
+    "rssi":{"min":-28,"avg":-27,"max":-26},
+    "snr":{"min":26,"avg":31,"max":35}},
+   {"freq":5745,"mcs":5,"bw":20,"id":"0","pkts":2286,
+    "rssi":{"min":-38,"avg":-37,"max":-36},
+    "snr":{"min":26,"avg":32,"max":38}}],
+ "pkt":{"all":2308,"bytes":2953783,"dec_err":21,"session":1,"data":2286,
+        "uniq":2286,"fec_recovered":49,"lost":0,"bad":0,
+        "outgoing":1252,"outgoing_bytes":1699183}}
+```
+
+| Field | Meaning |
+|---|---|
+| `ts_ms` | Emit timestamp (`get_time_ms()`). |
+| `seq` | Per-process monotonic counter (same semantics as wfb_tx). |
+| `interval_ms` | The `-l` value at emit time. |
+| `ant[].freq` / `mcs` / `bw` | Channel + modulation per the radiotap header. |
+| `ant[].id` | Hex string of `(sin_addr<<32) \| (wlan_idx<<8) \| ant_index`. Same packing the existing IPC `RX_ANT %PRIx64` uses. |
+| `ant[].pkts` | Packets seen on this antenna this interval. |
+| `ant[].rssi` / `snr` | min / avg / max in dBm and dB respectively. |
+| `pkt.all` / `bytes` | Total RF packets received this interval. |
+| `pkt.dec_err` | AEAD/decryption failures (off-channel chatter, mismatched -x, ...). |
+| `pkt.session` / `data` | Session-key vs data packet classification. |
+| `pkt.uniq` | Unique frames after FEC dedup. |
+| `pkt.fec_recovered` | Data packets recovered by FEC. |
+| `pkt.lost` | Data packets unrecoverable. |
+| `pkt.outgoing` / `outgoing_bytes` | Forwarded to `-c HOST:PORT`. |
+
+`ant` may be empty for the first datagram or two while the receiver
+warms up (no packets yet). `pkt.dec_err` may be high in the first
+second when the receiver picks up pre-existing off-channel traffic
+before its first session-key sync.
+
+### Backward compat
+
+Same rules as wfb_tx: omitting `-Y` keeps the stdout-only behavior;
+the `seq` field is additive on `ver:1`; consumers ignore unknown
+fields. `ground_rssi_forwarder.py` is **deprecated** — for new
+deployments, point a JSON-aware consumer at `wfb_rx -Y` directly.
+
+### Debug
+
+```bash
+# On the host running wfb_rx:
+nc -ul 5801 | jq -c '{seq, ant_count: (.ant | length), pkt_lost: .pkt.lost}'
+```
+
 ## Quick reference — recommended FPV config
 
 For a typical 25 Mbps H.265 FPV video stream (vehicle → ground, one-way):
