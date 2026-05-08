@@ -34,15 +34,26 @@ On the **vehicle** (sigmastar Infinity6E):
 
 ```sh
 scp csa_agent.armhf root@<vehicle>:/tmp/csa_agent
-ssh root@<vehicle> 'killall link_controller; /tmp/csa_agent 5801 wlan0'
+ssh root@<vehicle> 'killall link_controller; /tmp/csa_agent \
+    --allowlist 149/HT20,153/HT20,157/HT20,161/HT20,161/HT40+ \
+    5801 wlan0'
 ```
 
 On the **cpe510** ground relay (ath79):
 
 ```sh
 scp csa_agent.mips24kc root@<cpe510>:/tmp/csa_agent
-ssh root@<cpe510> '/tmp/csa_agent --no-revert 5802 wlan0mon'
+ssh root@<cpe510> '/tmp/csa_agent --no-revert \
+    --allowlist 149/HT20,153/HT20,157/HT20,161/HT20,161/HT40+ \
+    5802 wlan0mon'
 ```
+
+Flags:
+- `--allowlist CH/HT,...` — only listed targets are accepted (defense in
+  depth; rejects are logged as `REJECT ... not in allowlist`)
+- `--allow-dfs` — opt in to 5GHz DFS channels (52..144); refused by default
+- `--cooldown-ms N` — minimum gap between channel changes (default 2000;
+  0 disables; revert counts as a hop)
 
 `--no-revert` on the ground side: cpe510 owns the channel; auto-reverting
 on its own would be dangerous. Only the vehicle reverts if the link goes
@@ -85,8 +96,9 @@ sigmastar Infinity6E, ch161). RSSI ≈ −50 dBm.
 ## Known gaps before production
 
 1. Stops link_controller during use — needs to fold into link_controller.
-2. No allowed-channel allowlist / DFS guard.
-3. No cooldown to prevent rapid re-hops.
-4. Loss tolerance untested at degraded RSSI.
-5. No bidirectional ack (downlink confirmation that vehicle followed).
-6. No auth — anyone on the LAN can inject CSA on 5802.
+2. Loss tolerance untested at degraded RSSI.
+3. No bidirectional ack (downlink confirmation that vehicle followed).
+4. No auth — anyone on the LAN can inject CSA on 5802. `sess` blocks replay
+   within agent uptime, but a fresh forgery just picks `sess > current` and
+   wins. Allowlist + DFS guard + cooldown limit blast radius; HMAC closes
+   the gap. See `PROTOCOL.md` "Replay-protection scope".

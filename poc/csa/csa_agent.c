@@ -81,6 +81,61 @@ static bool get_int(const char *buf, const char *key, long long *out) {
     return true;
 }
 
+/* ----- allowlist + DFS guard + cooldown ----- */
+/* 5 GHz DFS channels (UNII-2 + UNII-2-extended). Hopping into these without
+ * CAC is a regulatory violation in most regions, so they are blocked unless
+ * --allow-dfs is set on the command line. */
+static const int DFS_CHANS[] = {
+    52, 56, 60, 64,
+    100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144,
+};
+
+static bool is_dfs(int chan) {
+    for (size_t i = 0; i < sizeof(DFS_CHANS)/sizeof(DFS_CHANS[0]); i++) {
+        if (DFS_CHANS[i] == chan) return true;
+    }
+    return false;
+}
+
+#define MAX_ALLOW 32
+typedef struct { int chan; char ht[8]; } allow_t;
+static allow_t g_allow[MAX_ALLOW];
+static int g_allow_n = 0;
+static int g_allow_dfs = 0;
+static long long g_cooldown_ms = 2000;       /* 0 disables */
+static long long g_last_switch_ms = -1;      /* -1 = no prior switch */
+
+/* "149/HT20,153/HT20,161/HT40+" -> g_allow[]. Returns 0 on success, -1 on parse error. */
+static int parse_allowlist(const char *s) {
+    g_allow_n = 0;
+    const char *p = s;
+    while (*p && g_allow_n < MAX_ALLOW) {
+        char *end;
+        long c = strtol(p, &end, 10);
+        if (end == p || *end != '/') return -1;
+        p = end + 1;
+        const char *htstart = p;
+        while (*p && *p != ',') p++;
+        size_t htlen = (size_t)(p - htstart);
+        if (htlen == 0 || htlen >= sizeof(g_allow[0].ht)) return -1;
+        g_allow[g_allow_n].chan = (int)c;
+        memcpy(g_allow[g_allow_n].ht, htstart, htlen);
+        g_allow[g_allow_n].ht[htlen] = 0;
+        g_allow_n++;
+        if (*p == ',') p++;
+    }
+    return (*p == 0) ? 0 : -1;
+}
+
+static bool allowlist_ok(int chan, const char *ht) {
+    if (g_allow_n == 0) return true;  /* unset == permissive */
+    for (int i = 0; i < g_allow_n; i++) {
+        if (g_allow[i].chan == chan && strcmp(g_allow[i].ht, ht) == 0)
+            return true;
+    }
+    return false;
+}
+
 /* ----- iw spawning ----- */
 static int run_iw(const char *iface, int chan, const char *ht) {
     char chan_s[16]; snprintf(chan_s, sizeof(chan_s), "%d", chan);
@@ -134,7 +189,30 @@ static void on_commit(agent_t *a, const char *buf, ssize_t len) {
     long long now = now_ms();
     long long t_switch = now + dt;
 
+    /* Defense-in-depth target validation. Applied to every csa_commit so that
+     * even refresh frames carrying a tampered target are caught. */
+    if (!g_allow_dfs && is_dfs((int)target_chan)) {
+        log_msg("REJECT sess=%lld seq=%lld: target ch%lld is DFS (use --allow-dfs)",
+                sess, seq, target_chan);
+        return;
+    }
+    if (!allowlist_ok((int)target_chan, target_ht)) {
+        log_msg("REJECT sess=%lld seq=%lld: target ch%lld %s not in allowlist",
+                sess, seq, target_chan, target_ht);
+        return;
+    }
+
     if (a->st == ST_IDLE || sess > a->sess) {
+        /* Cooldown only gates NEW sessions; same-session refreshes are always
+         * allowed (they refine T_switch within ±20ms of the original). */
+        if (g_cooldown_ms > 0 && g_last_switch_ms >= 0) {
+            long long since = now - g_last_switch_ms;
+            if (since < g_cooldown_ms) {
+                log_msg("REJECT sess=%lld seq=%lld: cooldown %lldms remaining",
+                        sess, seq, g_cooldown_ms - since);
+                return;
+            }
+        }
         a->st = ST_ARMED;
         a->sess = sess;
         a->t_switch_ms = t_switch;
@@ -167,6 +245,7 @@ static void tick(agent_t *a) {
         log_msg("SWITCH at +%lldms (target ch%d %s)",
                 now - a->t_switch_ms, a->target_chan, a->target_ht);
         run_iw(a->iface, a->target_chan, a->target_ht);
+        g_last_switch_ms = now_ms();  /* anchors cooldown for the next session */
         if (a->no_revert) {
             log_msg("state=COMMITTED (no-revert mode)");
             to_idle(a);
@@ -178,20 +257,47 @@ static void tick(agent_t *a) {
     } else if (a->st == ST_VERIFY && now >= a->t_revert_ms) {
         log_msg("REVERT triggered (no traffic seen on new channel)");
         run_iw(a->iface, a->prev_chan, a->prev_ht);
+        g_last_switch_ms = now_ms();  /* revert is itself a hop */
         to_idle(a);
     }
 }
 
+static void usage(const char *argv0) {
+    fprintf(stderr,
+        "usage: %s [--no-revert] [--allow-dfs] [--allowlist CH/HT,...] "
+        "[--cooldown-ms N] <port> <iface>\n"
+        "  --allowlist  comma-separated CH/HT pairs accepted as targets\n"
+        "               (e.g. 149/HT20,153/HT20,161/HT40+); empty = permissive\n"
+        "  --allow-dfs  permit hops into 5GHz DFS channels (52..144)\n"
+        "  --cooldown-ms minimum gap between channel changes (default 2000, 0 disables)\n",
+        argv0);
+}
+
 int main(int argc, char **argv) {
     int no_revert = 0;
+    const char *allowlist_arg = NULL;
     int argi = 1;
-    if (argi < argc && strcmp(argv[argi], "--no-revert") == 0) {
-        no_revert = 1; argi++;
+    while (argi < argc && argv[argi][0] == '-' && argv[argi][1] == '-') {
+        const char *flag = argv[argi];
+        if (strcmp(flag, "--no-revert") == 0) {
+            no_revert = 1; argi++;
+        } else if (strcmp(flag, "--allow-dfs") == 0) {
+            g_allow_dfs = 1; argi++;
+        } else if (strcmp(flag, "--allowlist") == 0 && argi + 1 < argc) {
+            allowlist_arg = argv[argi + 1]; argi += 2;
+        } else if (strcmp(flag, "--cooldown-ms") == 0 && argi + 1 < argc) {
+            g_cooldown_ms = strtoll(argv[argi + 1], NULL, 10); argi += 2;
+        } else {
+            fprintf(stderr, "unknown flag: %s\n", flag);
+            usage(argv[0]);
+            return 2;
+        }
     }
-    if (argc - argi < 2) {
-        fprintf(stderr, "usage: %s [--no-revert] <port> <iface>\n", argv[0]);
+    if (allowlist_arg && parse_allowlist(allowlist_arg) < 0) {
+        fprintf(stderr, "bad --allowlist: %s\n", allowlist_arg);
         return 2;
     }
+    if (argc - argi < 2) { usage(argv[0]); return 2; }
     int port = atoi(argv[argi++]);
     const char *iface = argv[argi++];
 
@@ -205,8 +311,9 @@ int main(int argc, char **argv) {
 
     agent_t ag = { .st = ST_IDLE, .no_revert = no_revert };
     snprintf(ag.iface, sizeof(ag.iface), "%s", iface);
-    log_msg("csa_agent listening port=%d iface=%s no_revert=%d",
-            port, iface, no_revert);
+    log_msg("csa_agent listening port=%d iface=%s no_revert=%d "
+            "allow_dfs=%d cooldown_ms=%lld allowlist=%d entries",
+            port, iface, no_revert, g_allow_dfs, g_cooldown_ms, g_allow_n);
 
     char buf[4096];
     struct timeval tv;

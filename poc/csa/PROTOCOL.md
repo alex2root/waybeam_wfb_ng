@@ -54,6 +54,23 @@ frame seen in a session; subsequent frames in the same session refresh
 the `dt`-derived target if it lands within ±20 ms of the original
 (otherwise dropped — likely reorder).
 
+## Receiver guards
+
+Every `csa_commit` is filtered by these checks before entering the state
+machine. They are configured via `csa_agent` CLI flags:
+
+| Guard | Flag | Default |
+|---|---|---|
+| Channel allowlist | `--allowlist 149/HT20,153/HT20,161/HT40+` | unset (permissive) |
+| DFS guard (block 5GHz 52..144) | `--allow-dfs` to disable | enabled |
+| Cooldown between switches | `--cooldown-ms N` (0 disables) | 2000 ms |
+
+A frame failing allowlist or DFS guard is dropped silently on the wire and
+logged as `REJECT … not in allowlist` / `… is DFS` on the agent. Cooldown
+gates only **new** sessions; same-session refresh frames are always allowed
+(they refine `T_switch` within ±20 ms of the original). Cooldown is anchored
+on every channel change, including auto-revert.
+
 ## Receiver state machine
 
 ```
@@ -94,11 +111,28 @@ VERIFY(S, target, prev, T_alive_deadline)
 5. After `lead_ms + t_revert_ms`, optionally probe vehicle reachability via
    ethernet (192.168.1.13) and report.
 
+## Replay-protection scope
+
+`sess` provides newest-wins replay protection **within an agent's uptime**.
+A captured frame from a prior session has `sess <= a->sess` and is rejected.
+
+What `sess` does NOT cover:
+
+- **Agent reboot** resets the high-water mark; an old captured frame can be
+  replayed once before the next legitimate session bumps `sess` past it. A
+  persistent monotonic on disk would close this. Cooldown limits damage to
+  one hop per `cooldown_ms`.
+- **Fabrication on the LAN side** — anyone reachable on `cpe510:5802` (or
+  the over-air uplink) can pick `sess > current` and inject a hop. This is
+  not replay; only a MAC (HMAC + shared key) can stop it. Allowlist + DFS
+  guard contain the blast radius if it happens.
+
+`seq` is for logging and burst correlation only — not used for filtering.
+
 ## Out of scope for v0.1
 
 - Bidirectional ack from vehicle (would need link_controller integration).
-- DFS targets (52–144).
 - Width changes without channel changes.
 - Cancel / supersede mid-flight.
-- HMAC / replay protection beyond `sess` monotonicity.
-- Rate-limit / cool-down enforcement (orchestrator side will add later).
+- HMAC + persistent monotonic session for cross-reboot replay protection
+  and authenticity.
