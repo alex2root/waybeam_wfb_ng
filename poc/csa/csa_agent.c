@@ -190,7 +190,14 @@ static void on_commit(agent_t *a, const char *buf, ssize_t len) {
     long long t_switch = now + dt;
 
     /* Defense-in-depth target validation. Applied to every csa_commit so that
-     * even refresh frames carrying a tampered target are caught. */
+     * even refresh frames carrying a tampered target are caught. The range
+     * check runs first so that DFS / allowlist comparisons cannot be tricked
+     * by a value that wraps under (int) truncation. */
+    if (target_chan < 1 || target_chan > 200) {
+        log_msg("REJECT sess=%lld seq=%lld: target_chan=%lld out of range",
+                sess, seq, target_chan);
+        return;
+    }
     if (!g_allow_dfs && is_dfs((int)target_chan)) {
         log_msg("REJECT sess=%lld seq=%lld: target ch%lld is DFS (use --allow-dfs)",
                 sess, seq, target_chan);
@@ -199,6 +206,17 @@ static void on_commit(agent_t *a, const char *buf, ssize_t len) {
     if (!allowlist_ok((int)target_chan, target_ht)) {
         log_msg("REJECT sess=%lld seq=%lld: target ch%lld %s not in allowlist",
                 sess, seq, target_chan, target_ht);
+        return;
+    }
+
+    /* Tail-of-burst csa_commit frames arriving after SWITCH on the new
+     * channel confirm the link the same way other UDP traffic would.
+     * PROTOCOL.md says "any UDP frame (CSA or stats) before deadline"
+     * confirms; without this branch a same-sess refresh would be silently
+     * dropped and we'd revert despite the channel being healthy. */
+    if (a->st == ST_VERIFY && sess == a->sess) {
+        log_msg("VERIFY heartbeat: csa_commit seq=%lld -> COMMITTED", seq);
+        to_idle(a);
         return;
     }
 
@@ -245,19 +263,24 @@ static void tick(agent_t *a) {
         log_msg("SWITCH at +%lldms (target ch%d %s)",
                 now - a->t_switch_ms, a->target_chan, a->target_ht);
         run_iw(a->iface, a->target_chan, a->target_ht);
-        g_last_switch_ms = now_ms();  /* anchors cooldown for the next session */
+        /* Anchor cooldown at the scheduled switch time, not after iw(8)
+         * returns, so the gap is deterministic regardless of how long the
+         * iw spawn takes (typ. 50–300 ms). */
+        g_last_switch_ms = now;
         if (a->no_revert) {
             log_msg("state=COMMITTED (no-revert mode)");
             to_idle(a);
             return;
         }
         a->st = ST_VERIFY;
+        /* Revert deadline is intentionally measured from after iw returns:
+         * we want to wait t_revert_ms of silence on the *new* channel. */
         a->t_revert_ms = now_ms() + a->t_revert_ms;
         log_msg("state=VERIFY revert_at=+%lldms", a->t_revert_ms - now_ms());
     } else if (a->st == ST_VERIFY && now >= a->t_revert_ms) {
         log_msg("REVERT triggered (no traffic seen on new channel)");
         run_iw(a->iface, a->prev_chan, a->prev_ht);
-        g_last_switch_ms = now_ms();  /* revert is itself a hop */
+        g_last_switch_ms = now;  /* revert is itself a hop */
         to_idle(a);
     }
 }
@@ -296,6 +319,20 @@ int main(int argc, char **argv) {
     if (allowlist_arg && parse_allowlist(allowlist_arg) < 0) {
         fprintf(stderr, "bad --allowlist: %s\n", allowlist_arg);
         return 2;
+    }
+    /* Warn (don't fail) on a configuration that's effectively unreachable:
+     * an allowlist entry sitting on a DFS channel will always be killed by
+     * the DFS guard unless --allow-dfs is also set. Easy footgun otherwise. */
+    if (g_allow_n > 0 && !g_allow_dfs) {
+        for (int i = 0; i < g_allow_n; i++) {
+            if (is_dfs(g_allow[i].chan)) {
+                fprintf(stderr,
+                    "warning: allowlist entry %d/%s is a DFS channel and "
+                    "will always be rejected by the DFS guard. "
+                    "Pass --allow-dfs to enable it.\n",
+                    g_allow[i].chan, g_allow[i].ht);
+            }
+        }
     }
     if (argc - argi < 2) { usage(argv[0]); return 2; }
     int port = atoi(argv[argi++]);
