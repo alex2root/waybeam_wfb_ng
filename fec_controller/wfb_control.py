@@ -29,7 +29,9 @@ log = logging.getLogger("fec_ctrl")
 # Command IDs (tx_cmd.h)
 CMD_SET_FEC = 1
 
-# fec_timeout_ms sentinel: "leave the running value unchanged"
+# fec_timeout_ms sentinel: "leave the running value unchanged".
+# Canonical definition in poc/shm-input.patch (src/tx_cmd.h); also
+# mirrored in poc/link_controller.c.  Keep all three in sync.
 WFB_FEC_TIMEOUT_KEEP = 0xFFFF
 
 # Packed request: uint32_t req_id, uint8_t cmd_id, uint8_t k, uint8_t n,
@@ -53,27 +55,37 @@ class WfbTxControl:
         """Send CMD_SET_FEC to wfb_tx. Returns True on successful send.
 
         k and n are clamped to [0, 255] (uint8 wire format).
-        fec_timeout_ms is clamped to [0, 65535] (uint16). Pass
-        WFB_FEC_TIMEOUT_KEEP (default) to leave the running timeout
-        unchanged; pass 0 to disable the timeout safety-net entirely;
-        any other value sets the timeout in milliseconds.
+        fec_timeout_ms must be either:
+          - WFB_FEC_TIMEOUT_KEEP (default, 0xFFFF) -- leave the running
+            timeout unchanged; or
+          - an integer in [0, 65534] (uint16 wire format minus the
+            reserved sentinel).  0 disables the timeout safety-net
+            entirely; any other value sets the timeout in milliseconds.
+        Explicit values are clamped to [0, 65534]; 65535 is unreachable
+        as an explicit setting because that wire value is the
+        keep-current sentinel.
         """
         if not self._sock:
             self.connect()
         try:
             k = max(0, min(255, k))
             n = max(0, min(255, n))
-            fec_timeout_ms = max(0, min(0xFFFF, fec_timeout_ms))
+            # Pass-through the sentinel verbatim; clamp explicit values to
+            # the keep-sentinel-1 to prevent accidental sentinel collisions.
+            if fec_timeout_ms == WFB_FEC_TIMEOUT_KEEP:
+                wire_timeout = WFB_FEC_TIMEOUT_KEEP
+            else:
+                wire_timeout = max(0, min(0xFFFE, fec_timeout_ms))
             self._req_id = (self._req_id + 1) & 0xFFFFFFFF
             pkt = _REQ_SET_FEC.pack(self._req_id, CMD_SET_FEC, k, n,
-                                    fec_timeout_ms)
+                                    wire_timeout)
             self._sock.sendto(pkt, (self.host, self.port))
-            if fec_timeout_ms == WFB_FEC_TIMEOUT_KEEP:
+            if wire_timeout == WFB_FEC_TIMEOUT_KEEP:
                 log.info("Sent CMD_SET_FEC: k=%d n=%d (timeout: keep) -> %s:%d",
                          k, n, self.host, self.port)
             else:
                 log.info("Sent CMD_SET_FEC: k=%d n=%d timeout=%dms -> %s:%d",
-                         k, n, fec_timeout_ms, self.host, self.port)
+                         k, n, wire_timeout, self.host, self.port)
             return True
         except OSError as e:
             log.error("Failed to send FEC update: %s", e)

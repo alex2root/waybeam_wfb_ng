@@ -1467,7 +1467,7 @@ index 39506e6..e7a2cdc 100644
      const uint32_t channel_id; // (link_id << 8) + port_number
      const uint32_t fec_delay; // fec packet delay [us]
 diff --git a/src/tx_cmd.c b/src/tx_cmd.c
-index 7549e44..3aefaf5 100644
+index 7549e44..d963aeb 100644
 --- a/src/tx_cmd.c
 +++ b/src/tx_cmd.c
 @@ -122,10 +122,14 @@ int set_fec(char *progname, int port, int argc, char **argv)
@@ -1486,17 +1486,22 @@ index 7549e44..3aefaf5 100644
      {
          switch (opt)
          {
-@@ -137,9 +141,25 @@ int set_fec(char *progname, int port, int argc, char **argv)
+@@ -137,9 +141,31 @@ int set_fec(char *progname, int port, int argc, char **argv)
              n = atoi(optarg);
              break;
  
 +        case 'T':
 +        {
++            /* 65535 is reserved for WFB_FEC_TIMEOUT_KEEP (the "leave current
++             * value untouched" sentinel).  Reject it as an explicit value so
++             * users don't accidentally trigger keep-semantics by asking for
++             * a 65535 ms timeout.  Omit -T entirely to keep the running
++             * value. */
 +            char *endp;
 +            long v = strtol(optarg, &endp, 10);
-+            if (*endp != '\0' || endp == optarg || v < 0 || v > 0xFFFF)
++            if (*endp != '\0' || endp == optarg || v < 0 || v >= 0xFFFF)
 +            {
-+                fprintf(stderr, "fec_timeout (-T) must be an integer in 0..65535 ms\n");
++                fprintf(stderr, "fec_timeout (-T) must be an integer in 0..65534 ms (65535 is reserved)\n");
 +                return 1;
 +            }
 +            timeout_ms = v;
@@ -1508,13 +1513,14 @@ index 7549e44..3aefaf5 100644
 -            fprintf(stderr, "Default: k=%d, n=%d\n", k, n);
 +            fprintf(stderr, "Usage: %s <port> %s [-k RS_K] [-n RS_N] [-T fec_timeout_ms]\n", progname, argv[0]);
 +            fprintf(stderr, "Default: k=%d, n=%d, fec_timeout=keep-current\n", k, n);
-+            fprintf(stderr, "  -T 0       disables the FEC safety-net timeout\n");
++            fprintf(stderr, "  -T 0        disables the FEC safety-net timeout\n");
 +            fprintf(stderr, "  -T 1..65534 sets the timeout in milliseconds\n");
 +            fprintf(stderr, "  -T omitted  leaves the running fec_timeout untouched\n");
++            fprintf(stderr, "              (65535 is reserved internally as the keep-current sentinel)\n");
              fprintf(stderr, "WFB-ng version %s\n", WFB_VERSION);
              fprintf(stderr, "WFB-ng home page: <http://wfb-ng.org>\n");
              return 1;
-@@ -148,6 +168,7 @@ int set_fec(char *progname, int port, int argc, char **argv)
+@@ -148,6 +174,7 @@ int set_fec(char *progname, int port, int argc, char **argv)
  
      req.u.cmd_set_fec.k = k;
      req.u.cmd_set_fec.n = n;
@@ -1522,7 +1528,7 @@ index 7549e44..3aefaf5 100644
  
      return send_command(port, req, offsetof(cmd_req_t, u) + sizeof(req.u.cmd_set_fec), &resp);
  }
-@@ -233,9 +254,11 @@ int get_fec(char *progname, int port, int argc, char **argv)
+@@ -233,9 +260,11 @@ int get_fec(char *progname, int port, int argc, char **argv)
      if (rc == 0)
      {
          printf("k=%d\n"
@@ -1536,7 +1542,7 @@ index 7549e44..3aefaf5 100644
      }
  
      return rc;
-@@ -268,7 +291,6 @@ int get_radio(char *progname, int port, int argc, char **argv)
+@@ -268,7 +297,6 @@ int get_radio(char *progname, int port, int argc, char **argv)
      return rc;
  }
  
@@ -1544,7 +1550,7 @@ index 7549e44..3aefaf5 100644
  int main(int argc, char **argv)
  {
      int port;
-@@ -285,7 +307,7 @@ int main(int argc, char **argv)
+@@ -285,7 +313,7 @@ int main(int argc, char **argv)
  
      if (argc < 3)
      {

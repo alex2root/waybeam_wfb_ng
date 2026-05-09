@@ -166,7 +166,11 @@ _Static_assert(sizeof(SidecarTransportInfo) == 16,
 /* Sentinel for set_fec.fec_timeout_ms meaning "leave the running value
  * unchanged".  link_controller doesn't compute a frame-period-based
  * fec_timeout today, so it always sends KEEP — the operator sets the
- * timeout via wfb_tx -T at boot. */
+ * timeout via wfb_tx -T at boot.
+ *
+ * Canonical definition lives in shm-input.patch (src/tx_cmd.h); also
+ * mirrored in fec_controller/wfb_control.py.  Keep all three in sync
+ * if the value ever changes — there is no shared header. */
 #define WFB_FEC_TIMEOUT_KEEP   0xFFFFu
 
 #pragma pack(push, 1)

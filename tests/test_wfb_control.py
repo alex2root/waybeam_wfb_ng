@@ -76,7 +76,9 @@ class TestWfbTxControl:
             receiver.close()
 
     def test_send_fec_timeout_clamped(self):
-        """fec_timeout_ms outside [0, 65535] is clamped."""
+        """Explicit fec_timeout_ms outside [0, 65534] is clamped — high
+        values land on 0xFFFE (max usable), not 0xFFFF which is reserved
+        for the keep-current sentinel."""
         receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         receiver.bind(("127.0.0.1", 0))
         port = receiver.getsockname()[1]
@@ -84,9 +86,15 @@ class TestWfbTxControl:
 
         try:
             ctrl = WfbTxControl("127.0.0.1", port)
+            # Out-of-range high → 0xFFFE (max), NOT 0xFFFF (sentinel).
             ctrl.send_fec(8, 12, fec_timeout_ms=999_999)
             data, _ = receiver.recvfrom(256)
-            assert _REQ_SET_FEC.unpack(data)[4] == 0xFFFF
+            assert _REQ_SET_FEC.unpack(data)[4] == 0xFFFE
+            # Largest valid explicit value preserved verbatim.
+            ctrl.send_fec(8, 12, fec_timeout_ms=0xFFFE)
+            data, _ = receiver.recvfrom(256)
+            assert _REQ_SET_FEC.unpack(data)[4] == 0xFFFE
+            # Negative → 0 (disable).
             ctrl.send_fec(8, 12, fec_timeout_ms=-5)
             data, _ = receiver.recvfrom(256)
             assert _REQ_SET_FEC.unpack(data)[4] == 0

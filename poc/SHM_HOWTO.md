@@ -310,6 +310,20 @@ it.  The CLI shortcut is `wfb_tx_cmd <port> set_fec -k K -n N -T MS`
 (omit `-T` to keep current).  `wfb_tx_cmd <port> get_fec` reports the
 running `fec_timeout_ms`.
 
+**Reserved value:** wire value `0xFFFF` (= 65535 ms) is the
+keep-current sentinel.  Explicit timeouts are limited to **0..65534
+ms** — 65 seconds is far beyond any sensible video FEC bound, so the
+ceiling has no practical effect.  `wfb_tx_cmd set_fec -T 65535` is
+rejected; `WfbTxControl.send_fec(..., fec_timeout_ms=65535)` is
+clamped to 65534 to prevent accidental sentinel collisions.
+
+> **Tip:** at launch (`wfb_tx -T <ms>`) the upstream CLI uses `atoi`
+> and accepts any positive integer, so a launch-time value above
+> 65534 will be reported by `get_fec` clamped to 65535.  Round-tripping
+> that value through `set_fec` would land on the sentinel and silently
+> "keep current" — which preserves the launch value, so the result is
+> the same.  Set sub-65 s timeouts and this never matters.
+
 
 ## Cleartext data mode (`-x`)
 
