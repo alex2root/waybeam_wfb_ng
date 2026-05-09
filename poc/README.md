@@ -56,7 +56,7 @@ to stock wfb-ng.
 | `fec_controller` | `build/fec_controller` | ARM dyn (34 KB) | Legacy single-purpose FEC controller. Superseded by `link_controller`; kept for rollback / A/B comparison. REST/SSE API on :8765. |
 | `mcs_selector` | `build/mcs_selector` | ARM dyn (34 KB) | Legacy single-purpose MCS controller. Superseded by `link_controller`; kept for rollback. REST/SSE API on :8766. |
 | `wfb_tx` | `build/wfb_tx` | ARM static (543 KB) | wfb-ng tx with `-H` (SHM input), `-Y host:port` (UDP stats push), `-x` aux flag. |
-| `wfb_tx_cmd` | `build/wfb_tx_cmd` | ARM static (318 KB) | Runtime control: `set_fec`, `set_radio`, `set_mbit`, `get_radio`. |
+| `wfb_tx_cmd` | `build/wfb_tx_cmd` | ARM static (318 KB) | Runtime control: `set_fec` (with `-T fec_timeout_ms`), `set_radio`, `get_fec`, `get_radio`. |
 | `wfb_keygen` | `build/wfb_keygen` | ARM static (423 KB) | Key generator (drone/gs keys). |
 | `wfb_rx_native` | `build/wfb_rx_native` | x86_64 dyn (67 KB) | wfb-ng rx with `-Y host:port` (per-antenna JSON stats push). For ground host. |
 | `shm_ring_stats` | `build/shm_ring_stats` | ARM dyn (10 KB) | Snapshot of the SHM ring state. |
@@ -703,14 +703,17 @@ Talks to the wfb_tx control port (default 8000). All commands take
 # Read radio params
 wfb_tx_cmd 8000 get_radio
 
-# Change FEC sizing live
+# Change FEC sizing live (timeout untouched)
 wfb_tx_cmd 8000 set_fec -k 8 -n 12
+
+# Change FEC sizing AND the safety-net timeout in one call
+wfb_tx_cmd 8000 set_fec -k 8 -n 12 -T 16
 
 # Change MCS index (note: -M, NOT positional)
 wfb_tx_cmd 8000 set_radio -M 5
 
-# Change bitrate hint
-wfb_tx_cmd 8000 set_mbit -B 20
+# Read current FEC + timeout
+wfb_tx_cmd 8000 get_fec
 ```
 
 **Gotcha:** `wfb_tx_cmd 8000 set_radio mcs_index 7` does NOT work —

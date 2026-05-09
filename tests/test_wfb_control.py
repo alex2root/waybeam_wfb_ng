@@ -4,7 +4,12 @@ import struct
 import socket
 import pytest
 
-from fec_controller.wfb_control import WfbTxControl, CMD_SET_FEC, _REQ_SET_FEC
+from fec_controller.wfb_control import (
+    WfbTxControl,
+    CMD_SET_FEC,
+    WFB_FEC_TIMEOUT_KEEP,
+    _REQ_SET_FEC,
+)
 
 
 class TestWfbTxControl:
@@ -21,11 +26,13 @@ class TestWfbTxControl:
             assert ctrl.send_fec(8, 12) is True
 
             data, addr = receiver.recvfrom(256)
-            assert len(data) == 7
-            req_id, cmd_id, k, n = _REQ_SET_FEC.unpack(data)
+            assert len(data) == 9
+            req_id, cmd_id, k, n, fec_timeout_ms = _REQ_SET_FEC.unpack(data)
             assert cmd_id == CMD_SET_FEC
             assert k == 8
             assert n == 12
+            # Default omits fec_timeout — wire carries the "keep" sentinel.
+            assert fec_timeout_ms == WFB_FEC_TIMEOUT_KEEP
         finally:
             ctrl.close()
             receiver.close()
@@ -41,10 +48,56 @@ class TestWfbTxControl:
             ctrl = WfbTxControl("127.0.0.1", port)
             assert ctrl.send_fec(4, 7) is True
             data, _ = receiver.recvfrom(256)
-            req_id, cmd_id, k, n = _REQ_SET_FEC.unpack(data)
+            req_id, cmd_id, k, n, fec_timeout_ms = _REQ_SET_FEC.unpack(data)
             assert cmd_id == CMD_SET_FEC
             assert k == 4
             assert n == 7
+        finally:
+            ctrl.close()
+            receiver.close()
+
+    def test_send_fec_with_timeout(self):
+        """fec_timeout_ms reaches the wire when explicitly passed."""
+        receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        receiver.bind(("127.0.0.1", 0))
+        port = receiver.getsockname()[1]
+        receiver.settimeout(2.0)
+
+        try:
+            ctrl = WfbTxControl("127.0.0.1", port)
+            assert ctrl.send_fec(8, 12, fec_timeout_ms=16) is True
+            data, _ = receiver.recvfrom(256)
+            _, _, k, n, fec_timeout_ms = _REQ_SET_FEC.unpack(data)
+            assert k == 8
+            assert n == 12
+            assert fec_timeout_ms == 16
+        finally:
+            ctrl.close()
+            receiver.close()
+
+    def test_send_fec_timeout_clamped(self):
+        """Explicit fec_timeout_ms outside [0, 65534] is clamped — high
+        values land on 0xFFFE (max usable), not 0xFFFF which is reserved
+        for the keep-current sentinel."""
+        receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        receiver.bind(("127.0.0.1", 0))
+        port = receiver.getsockname()[1]
+        receiver.settimeout(2.0)
+
+        try:
+            ctrl = WfbTxControl("127.0.0.1", port)
+            # Out-of-range high → 0xFFFE (max), NOT 0xFFFF (sentinel).
+            ctrl.send_fec(8, 12, fec_timeout_ms=999_999)
+            data, _ = receiver.recvfrom(256)
+            assert _REQ_SET_FEC.unpack(data)[4] == 0xFFFE
+            # Largest valid explicit value preserved verbatim.
+            ctrl.send_fec(8, 12, fec_timeout_ms=0xFFFE)
+            data, _ = receiver.recvfrom(256)
+            assert _REQ_SET_FEC.unpack(data)[4] == 0xFFFE
+            # Negative → 0 (disable).
+            ctrl.send_fec(8, 12, fec_timeout_ms=-5)
+            data, _ = receiver.recvfrom(256)
+            assert _REQ_SET_FEC.unpack(data)[4] == 0
         finally:
             ctrl.close()
             receiver.close()
@@ -163,7 +216,7 @@ class TestWfbTxControl:
 
         try:
             ctrl = WfbTxControl("127.0.0.1", port)
-            ctrl.send_fec(8, 12)
+            ctrl.send_fec(8, 12, fec_timeout_ms=16)
             data, _ = receiver.recvfrom(256)
             # req_id=1 in big-endian: 0x00000001
             assert data[:4] == b"\x00\x00\x00\x01"
@@ -172,6 +225,8 @@ class TestWfbTxControl:
             # k, n at offsets 5, 6
             assert data[5] == 8
             assert data[6] == 12
+            # fec_timeout_ms at offsets 7..8, big-endian uint16
+            assert data[7:9] == b"\x00\x10"
         finally:
             ctrl.close()
             receiver.close()
