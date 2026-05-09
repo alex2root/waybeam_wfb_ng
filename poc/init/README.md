@@ -49,7 +49,7 @@ When enabled, `start` does:
 2. `iw dev wlan0 set monitor otherbss` + bring link up
 3. `iw dev wlan0 set channel <chan> <htmode>` (default 161 / HT20)
 4. `iw dev wlan0 set txpower fixed <mBm>` (default 2000 = 20 dBm)
-5. `wfb_tx -H local_shm ... -M 2 -k 8 -n 12 -P 1 -Q -S 1 -L 1 -b 1 -x`
+5. `wfb_tx -H local_shm ... -M 2 -k 8 -n 12 -P 1 -Q -S 1 -L 1 -T 16 -x`
 6. `wfb_rx -i 208 -u 5801` (uplink data → 127.0.0.1:5801)
 7. `link_controller --safe-startup-bitrate 4096`
 

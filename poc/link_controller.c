@@ -155,13 +155,19 @@ _Static_assert(sizeof(SidecarTransportInfo) == 16,
 #define CMD_GET_RADIO  4
 
 /* Wire layout: req_id(4) + cmd_id(1) = 5-byte CmdReq header. SET_FEC adds
- * 2 bytes (k,n); SET_RADIO adds RadioBody (7 bytes). GET_RADIO is just
- * the header. Centralised so the sendto() length args don't drift from
- * the struct definitions. */
+ * 4 bytes (k, n, fec_timeout_ms); SET_RADIO adds RadioBody (7 bytes).
+ * GET_RADIO is just the header. Centralised so the sendto() length args
+ * don't drift from the struct definitions. */
 #define CMD_REQ_HEADER         5
 #define CMD_REQ_GET_RADIO_LEN  CMD_REQ_HEADER
-#define CMD_REQ_SET_FEC_LEN    (CMD_REQ_HEADER + 2)
+#define CMD_REQ_SET_FEC_LEN    (CMD_REQ_HEADER + 4)
 #define CMD_REQ_SET_RADIO_LEN  (CMD_REQ_HEADER + 7)   /* + sizeof(RadioBody) */
+
+/* Sentinel for set_fec.fec_timeout_ms meaning "leave the running value
+ * unchanged".  link_controller doesn't compute a frame-period-based
+ * fec_timeout today, so it always sends KEEP — the operator sets the
+ * timeout via wfb_tx -T at boot. */
+#define WFB_FEC_TIMEOUT_KEEP   0xFFFFu
 
 #pragma pack(push, 1)
 typedef struct {
@@ -178,9 +184,9 @@ typedef struct {
 	uint32_t req_id;       /* network byte order */
 	uint8_t  cmd_id;
 	union {
-		struct { uint8_t k, n; } set_fec;
-		RadioBody                set_radio;
-		struct { uint8_t pad; }  get_radio;
+		struct { uint8_t k, n; uint16_t fec_timeout_ms; } set_fec;
+		RadioBody                                          set_radio;
+		struct { uint8_t pad; }                            get_radio;
 	} u;
 } CmdReq;
 
@@ -1639,6 +1645,9 @@ static int wfb_send_set_fec(const Config *cfg, int k, int n)
 	req.cmd_id = CMD_SET_FEC;
 	req.u.set_fec.k = (uint8_t)k;
 	req.u.set_fec.n = (uint8_t)n;
+	/* link_controller leaves fec_timeout in the operator's hands: -T at
+	 * boot wins, runtime SET_FEC keeps that value untouched. */
+	req.u.set_fec.fec_timeout_ms = htons(WFB_FEC_TIMEOUT_KEEP);
 
 	ssize_t s = sendto(fd, &req, CMD_REQ_SET_FEC_LEN, 0,
 	                   (const struct sockaddr*)&dst, sizeof(dst));

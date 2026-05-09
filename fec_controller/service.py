@@ -142,7 +142,7 @@ class FECControllerService:
                 params.packets_per_frame,
             )
         else:
-            self.wfb_tx.send_fec(params.k, params.n)
+            self.wfb_tx.send_fec(params.k, params.n, params.fec_timeout_ms)
 
     def _handle_frame(self, data: bytes) -> None:
         """Process a sidecar FRAME message."""

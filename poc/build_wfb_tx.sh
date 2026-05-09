@@ -12,9 +12,10 @@
 #   ./build_wfb_tx.sh --deploy   # build + scp to device
 #
 # Output (all in build/):
-#   wfb_tx             - patched wfb_tx with -H (SHM), -b, -r, -x flags
+#   wfb_tx             - patched wfb_tx with -H (SHM), -x, -Y flags
 #                        (cross, dynamic — libsodium/libstdc++ from device rootfs)
-#   wfb_tx_cmd         - runtime control client (set_fec, set_radio, set_mbit, get_*) (cross, dynamic)
+#   wfb_tx_cmd         - runtime control client (set_fec [-T fec_timeout_ms],
+#                        set_radio, get_fec, get_radio) (cross, dynamic)
 #   wfb_keygen         - key generator (cross, dynamic)
 #   shm_ring_stats     - ring status checker (cross, dynamic)
 #   shm_consumer_test  - ring throughput tester (cross, dynamic)
