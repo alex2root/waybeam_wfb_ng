@@ -1,0 +1,57 @@
+# Build the venc_proxy POC.
+#
+# venc_proxy runs on the GROUND host alongside wfb_tx_native, so the
+# native host build is the primary target. A cross-build target is
+# provided for the case where the ground host is itself an armv7l
+# OpenIPC box (rare but supported — same toolchain as link_controller).
+#
+# Usage (from waybeam_wfb_ng/poc/):
+#   make -f Makefile.venc_proxy           # native host build (default)
+#   make -f Makefile.venc_proxy cross     # armv7l OpenIPC cross-build
+#   make -f Makefile.venc_proxy clean
+#
+# Env:
+#   TOOLCHAIN=../toolchain/toolchain.sigmastar-infinity6e   (cross only)
+
+TOOLCHAIN   ?= ../toolchain/toolchain.sigmastar-infinity6e
+CROSS_CC    ?= $(TOOLCHAIN)/bin/arm-openipc-linux-gnueabihf-gcc
+CROSS_STRIP ?= $(TOOLCHAIN)/bin/arm-openipc-linux-gnueabihf-strip
+
+BUILD_DIR   ?= build
+OUT_HOST     = $(BUILD_DIR)/venc_proxy
+OUT_CROSS    = $(BUILD_DIR)/venc_proxy.armv7l
+SRC          = venc_proxy.c
+HDR          = wcmd_proto.h
+
+CFLAGS_COMMON = -std=gnu99 -O2 -Wall -Wextra -Wno-missing-field-initializers
+LDFLAGS_COMMON =
+
+.PHONY: all host cross clean help
+
+all: host
+
+host: $(OUT_HOST)
+
+cross: $(OUT_CROSS)
+
+$(BUILD_DIR):
+	@mkdir -p $@
+
+$(OUT_HOST): $(SRC) $(HDR) | $(BUILD_DIR)
+	cc $(CFLAGS_COMMON) -I. -o $@ $(SRC) $(LDFLAGS_COMMON)
+	@echo "[venc_proxy] host build: $@"
+	@ls -la $@
+
+$(OUT_CROSS): $(SRC) $(HDR) | $(BUILD_DIR)
+	$(CROSS_CC) $(CFLAGS_COMMON) -I. -o $@ $(SRC) $(LDFLAGS_COMMON)
+	$(CROSS_STRIP) $@
+	@echo "[venc_proxy] cross build: $@"
+	@ls -la $@
+
+clean:
+	rm -f $(OUT_HOST) $(OUT_CROSS)
+
+help:
+	@echo "make -f Makefile.venc_proxy          # native host build"
+	@echo "make -f Makefile.venc_proxy cross    # armv7l OpenIPC cross-build"
+	@echo "make -f Makefile.venc_proxy clean"
