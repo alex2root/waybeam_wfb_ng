@@ -93,6 +93,7 @@ static const int GS_BACKOFF_MS[] = { 500, 1000, 2000, 4000, 8000, 16000, 30000 }
 
 static volatile sig_atomic_t g_shutdown = 0;
 static volatile sig_atomic_t g_sigchld  = 0;
+static int                   g_verbose  = 0;   /* -v: full info + inherit child stdout/stderr */
 
 static void on_signal(int sig)
 {
@@ -128,6 +129,9 @@ static void logf_(const char *level, const char *fmt, ...)
 #define LOG_INFO(...)  logf_("info",  __VA_ARGS__)
 #define LOG_WARN(...)  logf_("warn",  __VA_ARGS__)
 #define LOG_ERR(...)   logf_("err",   __VA_ARGS__)
+/* LOG_DEBUG silently dropped unless -v was passed. Use for per-event noise
+ * (argv dumps, respawn attempts) that's only useful when troubleshooting. */
+#define LOG_DEBUG(...) do { if (g_verbose) logf_("debug", __VA_ARGS__); } while (0)
 
 static int write_all(int fd, const void *buf, size_t len)
 {
@@ -761,7 +765,23 @@ static int tunnel_spawn(Tunnel *t, const char *key_file)
 		signal(SIGINT,  SIG_DFL);
 		signal(SIGHUP,  SIG_DFL);
 		signal(SIGPIPE, SIG_DFL);
+		/* Silence wfb_rx/wfb_tx PKT spam unless -v was passed.  Keep
+		 * stderr open just before exec so any exec failure message
+		 * still reaches the operator; redirect after the (failed)
+		 * exec is impossible, so we silence both fds up-front and
+		 * write the exec-failure message to a fresh fd 2 via /dev/tty
+		 * fallback — too fragile.  Instead leave stderr alone so the
+		 * exec error bubbles up; only stdout gets nulled. */
+		if (!g_verbose) {
+			int devnull = open("/dev/null", O_WRONLY);
+			if (devnull >= 0) {
+				dup2(devnull, STDOUT_FILENO);
+				dup2(devnull, STDERR_FILENO);
+				close(devnull);
+			}
+		}
 		execvp(ab.argv[0], ab.argv);
+		/* exec failed — best-effort error to whatever fd 2 points to. */
 		fprintf(stderr, "[gs] exec %s: %s\n", ab.argv[0], strerror(errno));
 		_exit(127);
 	}
@@ -885,6 +905,75 @@ static void run_system_block(const char *label, char cmds[][GS_PATH_MAX], int n)
 	for (int i = 0; i < n; i++) {
 		if (cmds[i][0]) (void)run_system_cmd(cmds[i]);
 	}
+}
+
+/* ---------- iface state validation ----------------------------------- *
+ *
+ * Run AFTER system.up. Confirms each iface declared in any tunnel:
+ *   - exists and is in monitor mode (via `iw dev <iface> info`)
+ *   - is administratively UP (via /sys/class/net/<iface>/flags, IFF_UP bit)
+ *
+ * If any check fails, the supervisor refuses to spawn tunnels. Spawning
+ * wfb_rx into a non-monitor iface produces opaque "pcap_activate failed"
+ * loops that aren't actionable.
+ */
+#define IFF_UP_BIT 0x1u
+
+static int iface_is_monitor(const char *iface)
+{
+	char cmd[256];
+	int n = snprintf(cmd, sizeof(cmd),
+	                 "iw dev %s info 2>/dev/null | grep -qE 'type monitor'",
+	                 iface);
+	if (n < 0 || n >= (int)sizeof(cmd)) return -1;
+	int rc = system(cmd);
+	return (rc == 0) ? 0 : -1;
+}
+
+static int iface_is_admin_up(const char *iface)
+{
+	char path[128];
+	int pn = snprintf(path, sizeof(path), "/sys/class/net/%s/flags", iface);
+	if (pn < 0 || pn >= (int)sizeof(path)) return -1;
+	FILE *f = fopen(path, "r");
+	if (!f) return -1;
+	unsigned long flags = 0;
+	int n = fscanf(f, "%lx", &flags);
+	fclose(f);
+	if (n != 1) return -1;
+	return (flags & IFF_UP_BIT) ? 0 : -1;
+}
+
+/* Returns 0 if all ifaces in all tunnels look correct; -1 on failure
+ * (with LOG_ERR diagnostics for each bad iface). */
+static int validate_iface_state(const Config *c)
+{
+	int bad = 0;
+	for (int i = 0; i < c->tunnel_count; i++) {
+		const Tunnel *t = &c->tunnels[i];
+		for (int k = 0; k < t->iface_count; k++) {
+			const char *ifc = t->ifaces[k];
+			if (iface_is_admin_up(ifc) != 0) {
+				LOG_ERR("iface '%s' is not administratively UP after "
+				        "system.up — check 'ip link set %s up'",
+				        ifc, ifc);
+				bad++;
+				continue;
+			}
+			if (iface_is_monitor(ifc) != 0) {
+				LOG_ERR("iface '%s' is not in monitor mode after "
+				        "system.up — check 'iw dev %s set monitor'",
+				        ifc, ifc);
+				bad++;
+			}
+		}
+	}
+	if (bad) {
+		LOG_ERR("%d iface check(s) failed; refusing to spawn tunnels", bad);
+		return -1;
+	}
+	LOG_INFO("iface state OK on %d tunnel(s)", c->tunnel_count);
+	return 0;
 }
 
 /* ---------- wfb_cmd passthrough -------------------------------------- *
@@ -1592,9 +1681,10 @@ static void shutdown_all(Config *c)
 static void usage(const char *argv0)
 {
 	fprintf(stderr,
-	    "usage: %s [--config PATH] [--port N]\n"
-	    "  --config PATH   JSON config (default %s)\n"
-	    "  --port N        override http.port from config\n",
+	    "usage: %s [--config PATH] [--port N] [-v]\n"
+	    "  -c, --config PATH   JSON config (default %s)\n"
+	    "  -p, --port N        override http.port from config\n"
+	    "  -v, --verbose       inherit wfb_rx/wfb_tx stdout/stderr (default: /dev/null)\n",
 	    argv0, GS_DEFAULT_CONFIG);
 }
 
@@ -1604,15 +1694,17 @@ int main(int argc, char **argv)
 	int port_override = -1;
 
 	static const struct option longopts[] = {
-		{ "config", required_argument, 0, 'c' },
-		{ "port",   required_argument, 0, 'p' },
-		{ "help",   no_argument,       0, 'h' },
+		{ "config",  required_argument, 0, 'c' },
+		{ "port",    required_argument, 0, 'p' },
+		{ "verbose", no_argument,       0, 'v' },
+		{ "help",    no_argument,       0, 'h' },
 		{ 0, 0, 0, 0 },
 	};
-	for (int o; (o = getopt_long(argc, argv, "c:p:h", longopts, NULL)) != -1;) {
+	for (int o; (o = getopt_long(argc, argv, "c:p:vh", longopts, NULL)) != -1;) {
 		switch (o) {
 		case 'c': cfg_path = optarg; break;
 		case 'p': port_override = atoi(optarg); break;
+		case 'v': g_verbose = 1; break;
 		case 'h': usage(argv[0]); return 0;
 		default:  usage(argv[0]); return 2;
 		}
@@ -1642,6 +1734,14 @@ int main(int argc, char **argv)
 	signal(SIGPIPE, SIG_IGN);
 
 	run_system_block("system.up", cfg.system_up, cfg.system_up_count);
+
+	if (validate_iface_state(&cfg) != 0) {
+		/* Bring back what system.up touched, then exit. The operator
+		 * needs to fix the bring-up sequence (typo'd iface name, missing
+		 * sudo, kernel module not loaded, etc.) before we can serve. */
+		run_system_block("system.down", cfg.system_down, cfg.system_down_count);
+		return 1;
+	}
 
 	int api_fd = api_listen_open(cfg.http_bind, cfg.http_port);
 	if (api_fd < 0) {
