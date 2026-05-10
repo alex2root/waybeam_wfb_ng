@@ -2395,12 +2395,12 @@ static int wcmd_emit(const Config *c, int key, int32_t value, uint16_t *seq_out)
  * target as a const byte array. Served at `/` when the request carries
  * Accept: text/html (browser path); curl with no overrides gets the
  * /api/v1/health-style help text instead. */
-#if __has_include("gs_webui_assets.h")
-#  include "gs_webui_assets.h"
+#if __has_include("gs_assets.h")
+#  include "gs_assets.h"
 #else
    static const unsigned char gs_webui_html[] =
-       "<!doctype html><h1>gs_webui_assets.h missing — run "
-       "`make -f Makefile.gs_supervisor webui`.</h1>";
+       "<!doctype html><h1>gs_assets.h missing — run "
+       "`make webui` from ground/.</h1>";
    static const unsigned int  gs_webui_html_len = sizeof(gs_webui_html) - 1;
 #endif
 
@@ -3350,6 +3350,13 @@ static void api_handle(ApiClient *cli, Config *c, uint64_t startup_us)
 			tunnel_request_stop(t);
 			t->autostart_on_exit = true;
 			t->backoff_idx = 0;
+			/* If the child was already gone (TS_BACKOFF or TS_STOPPED
+			 * after tunnel_request_stop's early-return), queue an
+			 * immediate respawn instead of leaving it parked. */
+			if (t->pid <= 0) {
+				t->state = TS_BACKOFF;
+				t->next_start_ms = now_ms();
+			}
 			api_send(cli->fd, 200, "application/json", "{\"ok\":true}", -1);
 			return;
 		}
