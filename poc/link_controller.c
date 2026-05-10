@@ -55,6 +55,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -152,6 +153,7 @@ _Static_assert(sizeof(SidecarTransportInfo) == 16,
 
 #define CMD_SET_FEC    1
 #define CMD_SET_RADIO  2
+#define CMD_GET_FEC    3
 #define CMD_GET_RADIO  4
 
 /* Wire layout: req_id(4) + cmd_id(1) = 5-byte CmdReq header. SET_FEC adds
@@ -198,7 +200,8 @@ typedef struct {
 	uint32_t req_id;
 	uint32_t rc;
 	union {
-		RadioBody get_radio;
+		RadioBody                                          get_radio;
+		struct { uint8_t k, n; uint16_t fec_timeout_ms; } get_fec;
 	} u;
 } CmdResp;
 #pragma pack(pop)
@@ -407,9 +410,13 @@ typedef struct {
 		int      rate_limit_ms;
 
 		/* Bitmask of WCMD_KEY_* values allowed through. Bit (key-1):
-		 *   bit 0 = BITRATE_KBPS, bit 1 = FPS,
-		 *   bit 2 = PAYLOAD_BYTES, bit 3 = FORCE_IDR.
-		 * Default 0x0F (all four enabled). Operators set 0 to make the
+		 *   bit 0  = BITRATE_KBPS, bit 1  = FPS,
+		 *   bit 2  = PAYLOAD_BYTES, bit 3  = FORCE_IDR,
+		 *   bit 4  = WFB_FEC_K,    bit 5  = WFB_FEC_N,
+		 *   bit 6  = WFB_MCS,      bit 7  = WFB_BANDWIDTH,
+		 *   bit 8  = WFB_LDPC,     bit 9  = WFB_STBC,
+		 *   bit 10 = WFB_SHORT_GI.
+		 * Default 0x07FF (all 11 enabled). Operators set 0 to make the
 		 * proxy purely diagnostic without disabling the rx_ant listener. */
 		int      allow_keys_mask;
 
@@ -422,6 +429,23 @@ typedef struct {
 		int      fps_max;
 		int      payload_min;
 		int      payload_max;
+		/* wfb_tx key clamps.  Mirror the wfb_cmd validation so an out-of-
+		 * range value is rejected at the proxy rather than silently
+		 * clipped by wfb_tx itself. */
+		int      wfb_fec_k_min, wfb_fec_k_max;
+		int      wfb_fec_n_min, wfb_fec_n_max;
+		int      wfb_mcs_min,   wfb_mcs_max;
+		int      wfb_bandwidth_min, wfb_bandwidth_max;
+		/* TX power clamp window (millibel-milliwatts; 100 mBm = 1 dBm).
+		 * Default 50..3000 covers everything realistic for our adapters
+		 * (RTL88x2CU/EU). The dispatch fork+execs `iw set txpower fixed`
+		 * against cmd.wfb_iface (or, if empty, csa.iface). */
+		int      wfb_txpower_min;
+		int      wfb_txpower_max;
+		/* WLAN iface that wfb_tx is bound to.  Optional; when empty the
+		 * txpower dispatch falls back to csa.iface. Set explicitly when
+		 * CSA is disabled. */
+		char     wfb_iface[16];
 	} cmd;
 
 	/* ── Common ── */
@@ -1393,7 +1417,46 @@ static int venc_apply(const Config *cfg, long bitrate_kbps, int payload_bytes)
  * the JSON path. See poc/wcmd_proto.h for the wire format and
  * poc/CMD_PROXY.md for the recipe. */
 
-#define WCMD_NUM_KEYS 4   /* highest defined WCMD_KEY_* value */
+/* Forward declarations: the wfb_cmd helpers live further down (grouped
+ * with the FEC/MCS subsystems) but the WCMD dispatcher needs to call
+ * them when a WCMD_KEY_WFB_* arrives. */
+static int wfb_send_set_fec(const Config *cfg, int k, int n);
+static int wfb_get_fec(const Config *cfg, int *k_out, int *n_out, int *to_out);
+static int wfb_get_radio(const Config *cfg, RadioBody *out);
+static int wfb_set_radio(const Config *cfg, const RadioBody *params);
+
+/* fork+exec `iw dev <iface> set txpower fixed <mBm>`; returns iw's exit
+ * status (0 on success). Synchronous; the call typically returns within
+ * 30–80 ms on RTL88x2CU/EU. */
+static int wfb_run_iw_txpower(const char *iface, int mbm)
+{
+	if (!iface || !iface[0]) return -1;
+	char mbm_s[16];
+	snprintf(mbm_s, sizeof(mbm_s), "%d", mbm);
+	pid_t pid = fork();
+	if (pid < 0) return -1;
+	if (pid == 0) {
+		execl("/usr/sbin/iw", "iw", "dev", iface, "set", "txpower",
+		      "fixed", mbm_s, (char*)NULL);
+		execlp("iw", "iw", "dev", iface, "set", "txpower",
+		       "fixed", mbm_s, (char*)NULL);
+		_exit(127);
+	}
+	int st;
+	waitpid(pid, &st, 0);
+	return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+}
+
+#define WCMD_NUM_KEYS 15   /* highest defined WCMD_KEY_* value */
+
+/* Burst-dedup window: GS may send 3 redundant copies of the same WCMD
+ * with the same seq to ride out single-FEC-block losses on the uplink.
+ * If we see the same (key, seq) again inside this window, we count it
+ * as a duplicate of an already-applied request and return OK without
+ * re-dispatching to the venc HTTP API or wfb_cmd.  500 ms comfortably
+ * covers a burst spaced across multiple FEC blocks; a hostile flood of
+ * the same seq just gets coalesced. */
+#define WCMD_BURST_DEDUP_US (500ULL * 1000ULL)
 
 typedef struct {
 	uint64_t recv_total;        /* every WCMD_REQ that passed magic/version */
@@ -1405,8 +1468,16 @@ typedef struct {
 	uint64_t rejected_range;
 	uint64_t rejected_rate;
 	uint64_t rejected_peer;
+	uint64_t coalesced_burst;   /* duplicates of the same seq inside window */
 	uint64_t http_errors;
 	uint64_t last_apply_us[WCMD_NUM_KEYS + 1]; /* indexed by key (1-based) */
+	/* Per-key burst-dedup: last_seq[key] holds the seq we last APPLIED;
+	 * last_seq_us[key] gates the WCMD_BURST_DEDUP_US window.  Initialised
+	 * to 0 in the parent zero-init; on first arrival we still want to
+	 * apply, so the dedup short-circuit only triggers when last_seq_us[k]
+	 * is non-zero AND the seq matches the last applied. */
+	uint16_t last_seq[WCMD_NUM_KEYS + 1];
+	uint64_t last_seq_us[WCMD_NUM_KEYS + 1];
 	uint64_t last_recv_us;
 	uint8_t  last_status;       /* WCMD_STATUS_* of most recent request */
 	uint8_t  last_key;
@@ -1435,6 +1506,15 @@ static int wcmd_build_path(uint8_t key, int32_t value, char *path, size_t path_s
 		break;
 	case WCMD_KEY_FORCE_IDR:
 		n = snprintf(path, path_sz, "/request/idr");
+		break;
+	case WCMD_KEY_RECORD:
+		/* Binary toggle: 1 starts a recording, 0 stops the active one.
+		 * Both endpoints are GETs and reply with `{"ok":true}` even when
+		 * the underlying state is already start/stop, so the burst-dedup
+		 * on this side is the main reason a 3-frame burst doesn't yield
+		 * three start/stop cycles. */
+		n = snprintf(path, path_sz,
+		             value ? "/api/v1/record/start" : "/api/v1/record/stop");
 		break;
 	default:
 		return -1;
@@ -1472,21 +1552,66 @@ static int wcmd_clamp_value(const Config *cfg, uint8_t key, int32_t *value)
 	case WCMD_KEY_FORCE_IDR:
 		*value = 0;
 		return 0;
+	case WCMD_KEY_WFB_FEC_K:
+		lo = cfg->cmd.wfb_fec_k_min;
+		hi = cfg->cmd.wfb_fec_k_max;
+		break;
+	case WCMD_KEY_WFB_FEC_N:
+		lo = cfg->cmd.wfb_fec_n_min;
+		hi = cfg->cmd.wfb_fec_n_max;
+		break;
+	case WCMD_KEY_WFB_MCS:
+		lo = cfg->cmd.wfb_mcs_min;
+		hi = cfg->cmd.wfb_mcs_max;
+		break;
+	case WCMD_KEY_WFB_BANDWIDTH:
+		lo = cfg->cmd.wfb_bandwidth_min;
+		hi = cfg->cmd.wfb_bandwidth_max;
+		break;
+	case WCMD_KEY_WFB_LDPC:
+	case WCMD_KEY_WFB_STBC:
+	case WCMD_KEY_WFB_SHORT_GI:
+	case WCMD_KEY_FEC_ENABLED:
+	case WCMD_KEY_MCS_ENABLED:
+	case WCMD_KEY_RECORD:
+		lo = 0; hi = 1;
+		break;
+	case WCMD_KEY_WFB_TXPOWER:
+		lo = cfg->cmd.wfb_txpower_min;
+		hi = cfg->cmd.wfb_txpower_max;
+		break;
 	default:
 		return -1;
 	}
 
-	if (lo <= 0 || hi <= 0 || lo > hi) return -1;
+	/* Reject the clamp window only when mis-configured.  hi==0 is a
+	 * sentinel for "operator left this unset"; lo==0 is legal (e.g.
+	 * MCS index, ldpc/stbc/short_gi booleans). */
+	if (hi <= 0 || lo > hi) return -1;
 	if (*value < lo) { *value = lo; return 1; }
 	if (*value > hi) { *value = hi; return 1; }
 	return (*value == orig) ? 0 : 1;
+}
+
+/* Stamp the per-key apply timestamp + seq on a successful dispatch.
+ * Centralised so every accept site updates both halves of the burst-
+ * dedup state — easy to forget if scattered. */
+static inline void wcmd_mark_applied(WcmdState *st, uint8_t key,
+                                     uint16_t seq, uint64_t now)
+{
+	st->last_apply_us[key] = now;
+	st->last_seq[key]      = seq;
+	st->last_seq_us[key]   = now;
 }
 
 /* Process one WCMD_REQ datagram (already validated for length and
  * magic/version). Always populates *resp; the caller sends it on the
  * rx_ant socket. Returns 0 on success, <0 only if dispatch was a no-op
  * (e.g. unknown key — caller may want to log differently). */
-static int wcmd_dispatch(const Config *cfg, const WcmdReq *req,
+/* cfg is non-const because the FEC_ENABLED / MCS_ENABLED keys flip the
+ * adaptive subsystem master switches at runtime — every other key path
+ * treats the struct as read-only. */
+static int wcmd_dispatch(Config *cfg, const WcmdReq *req,
                          const struct sockaddr_in *peer,
                          WcmdState *st, uint64_t now,
                          WcmdResp *resp)
@@ -1538,6 +1663,27 @@ static int wcmd_dispatch(const Config *cfg, const WcmdReq *req,
 		return 0;
 	}
 
+	/* Burst-dedup short-circuit: GS sends 3 redundant copies of every
+	 * single-shot WCMD with the same seq so that a single FEC-block loss
+	 * on the uplink can't drop the whole command.  If we've already
+	 * applied this exact (key, seq) inside WCMD_BURST_DEDUP_US, return
+	 * OK without re-dispatching — the original apply is the source of
+	 * truth and the duplicates are pure redundancy.
+	 *
+	 * Done BEFORE the rate-limit check so a legitimate burst doesn't
+	 * count against the operator's per-key floor. */
+	uint16_t req_seq = ntohs(req->seq);
+	if (st->last_seq_us[key] != 0 &&
+	    st->last_seq[key] == req_seq &&
+	    now - st->last_seq_us[key] < WCMD_BURST_DEDUP_US) {
+		resp->status      = WCMD_STATUS_OK;
+		resp->http_status = htons((uint16_t)st->last_http_status);
+		resp->applied_value = htonl((uint32_t)st->last_value);
+		st->coalesced_burst++;
+		st->last_status = resp->status;
+		return 0;
+	}
+
 	int32_t value = (int32_t)ntohl((uint32_t)req->value);
 	int clamp_rc  = wcmd_clamp_value(cfg, key, &value);
 	if (clamp_rc < 0) {
@@ -1560,6 +1706,155 @@ static int wcmd_dispatch(const Config *cfg, const WcmdReq *req,
 		}
 	}
 
+	/* Adaptive subsystem toggles — flip the master switch in cfg.  No
+	 * external I/O; the change takes effect on the FEC/MCS subsystem's
+	 * next tick.  Useful when the operator wants to pin a manual
+	 * wfb_fec_k / wfb_mcs without restarting link_controller. */
+	if (key == WCMD_KEY_FEC_ENABLED || key == WCMD_KEY_MCS_ENABLED) {
+		bool new_state = (value != 0);
+		if (key == WCMD_KEY_FEC_ENABLED) cfg->fec.enabled = new_state;
+		else                              cfg->mcs.enabled = new_state;
+		resp->status = WCMD_STATUS_OK;
+		resp->http_status   = htons(0);
+		resp->applied_value = htonl((uint32_t)(new_state ? 1 : 0));
+		wcmd_mark_applied(st, key, req_seq, now);
+		st->accepted++;
+		st->last_status = resp->status;
+		st->last_value  = new_state ? 1 : 0;
+		st->last_http_status = 0;
+		(void)clamp_rc;
+		return 0;
+	}
+
+	/* TX power lives outside the wfb_cmd surface — wfb_tx doesn't expose
+	 * txpower (the radio chip's TX power table is set by the kernel
+	 * driver), so the only way to push it is `iw dev … set txpower fixed`.
+	 * Adaptive MCS does not touch txpower today, so the value sticks
+	 * until the next WCMD or link_controller restart. */
+	if (key == WCMD_KEY_WFB_TXPOWER) {
+		const char *iface = cfg->cmd.wfb_iface[0]
+		    ? cfg->cmd.wfb_iface
+		    : (cfg->csa.iface[0] ? cfg->csa.iface : NULL);
+		if (!iface) {
+			resp->status = WCMD_STATUS_OUT_OF_RANGE;
+			st->rejected_range++;
+			st->last_status = resp->status;
+			return 0;
+		}
+		if (cfg->dry_run) {
+			resp->status = WCMD_STATUS_OK;
+			resp->http_status   = htons(0);
+			resp->applied_value = htonl((uint32_t)value);
+			wcmd_mark_applied(st, key, req_seq, now);
+			st->accepted++;
+			st->last_status = resp->status;
+			st->last_value  = value;
+			st->last_http_status = 0;
+			return 0;
+		}
+		int rc = wfb_run_iw_txpower(iface, (int)value);
+		if (rc != 0) {
+			/* Negative rc is our "fork/exec/waitpid failed" sentinel —
+			 * don't sign-extend it into the wire u16. Receiver would
+			 * see http_status=0xFFFF and decode it as 65535. Emit 0
+			 * and let status=HTTP_ERROR carry the meaning. */
+			uint16_t hs = (rc > 0 && rc <= 0xFFFF) ? (uint16_t)rc : 0;
+			resp->status = WCMD_STATUS_HTTP_ERROR;
+			resp->http_status = htons(hs);
+			st->http_errors++;
+			st->last_status = resp->status;
+			st->last_http_status = rc;
+			return 0;
+		}
+		resp->status        = WCMD_STATUS_OK;
+		resp->http_status   = htons(0);
+		resp->applied_value = htonl((uint32_t)value);
+		wcmd_mark_applied(st, key, req_seq, now);
+		st->accepted++;
+		st->last_status      = resp->status;
+		st->last_value       = value;
+		st->last_http_status = 0;
+		(void)clamp_rc;
+		return 0;
+	}
+
+	/* wfb_tx control keys go to a local wfb_cmd round-trip rather than
+	 * the venc HTTP surface.  Read current radio/fec state, mutate just
+	 * the requested field, write back via SET_RADIO / SET_FEC.  Caveat:
+	 * link_controller's adaptive FEC and MCS subsystems will overwrite
+	 * these on their next tick — toggle WCMD_KEY_FEC_ENABLED=0 /
+	 * WCMD_KEY_MCS_ENABLED=0 first if you want manual control to
+	 * stick. */
+	if (key >= WCMD_KEY_WFB_FEC_K && key <= WCMD_KEY_WFB_SHORT_GI) {
+		if (cfg->dry_run) {
+			resp->status = WCMD_STATUS_OK;
+			resp->http_status   = htons(0);
+			resp->applied_value = htonl((uint32_t)value);
+			wcmd_mark_applied(st, key, req_seq, now);
+			st->accepted++;
+			st->last_status = resp->status;
+			st->last_value  = value;
+			st->last_http_status = 0;
+			return 0;
+		}
+		int rc;
+		if (key == WCMD_KEY_WFB_FEC_K || key == WCMD_KEY_WFB_FEC_N) {
+			int k_now = -1, n_now = -1, to_now = -1;
+			if (wfb_get_fec(cfg, &k_now, &n_now, &to_now) != 0) {
+				resp->status = WCMD_STATUS_HTTP_ERROR;
+				resp->http_status = htons(0);
+				st->http_errors++;
+				st->last_status = resp->status;
+				return 0;
+			}
+			int new_k = (key == WCMD_KEY_WFB_FEC_K) ? value : k_now;
+			int new_n = (key == WCMD_KEY_WFB_FEC_N) ? value : n_now;
+			if (new_k > new_n) {
+				/* wfb_tx requires k <= n. */
+				resp->status = WCMD_STATUS_OUT_OF_RANGE;
+				st->rejected_range++;
+				st->last_status = resp->status;
+				return 0;
+			}
+			rc = wfb_send_set_fec(cfg, new_k, new_n);
+		} else {
+			RadioBody r = {0};
+			if (wfb_get_radio(cfg, &r) != 0) {
+				resp->status = WCMD_STATUS_HTTP_ERROR;
+				resp->http_status = htons(0);
+				st->http_errors++;
+				st->last_status = resp->status;
+				return 0;
+			}
+			switch (key) {
+			case WCMD_KEY_WFB_MCS:        r.mcs_index = (uint8_t)value; break;
+			case WCMD_KEY_WFB_BANDWIDTH:  r.bandwidth = (uint8_t)value; break;
+			case WCMD_KEY_WFB_LDPC:       r.ldpc      = value ? 1 : 0;  break;
+			case WCMD_KEY_WFB_STBC:       r.stbc      = (uint8_t)value; break;
+			case WCMD_KEY_WFB_SHORT_GI:   r.short_gi  = value ? 1 : 0;  break;
+			default: break;
+			}
+			rc = wfb_set_radio(cfg, &r);
+		}
+		if (rc != 0) {
+			resp->status = WCMD_STATUS_HTTP_ERROR;
+			resp->http_status = htons(0);
+			st->http_errors++;
+			st->last_status = resp->status;
+			return 0;
+		}
+		resp->status        = WCMD_STATUS_OK;
+		resp->http_status   = htons(0);
+		resp->applied_value = htonl((uint32_t)value);
+		wcmd_mark_applied(st, key, req_seq, now);
+		st->accepted++;
+		st->last_status      = resp->status;
+		st->last_value       = value;
+		st->last_http_status = 0;
+		(void)clamp_rc;
+		return 0;
+	}
+
 	char path[160];
 	if (wcmd_build_path(key, value, path, sizeof(path)) != 0) {
 		resp->status = WCMD_STATUS_UNKNOWN_KEY;
@@ -1572,7 +1867,7 @@ static int wcmd_dispatch(const Config *cfg, const WcmdReq *req,
 		resp->status = WCMD_STATUS_OK;
 		resp->http_status   = htons(200);
 		resp->applied_value = htonl((uint32_t)value);
-		st->last_apply_us[key] = now;
+		wcmd_mark_applied(st, key, req_seq, now);
 		st->accepted++;
 		st->last_status = resp->status;
 		st->last_value  = value;
@@ -1610,7 +1905,7 @@ static int wcmd_dispatch(const Config *cfg, const WcmdReq *req,
 	resp->status        = WCMD_STATUS_OK;
 	resp->http_status   = htons((uint16_t)(http_status > 0 ? http_status : 200));
 	resp->applied_value = htonl((uint32_t)value);
-	st->last_apply_us[key] = now;
+	wcmd_mark_applied(st, key, req_seq, now);
 	st->accepted++;
 	st->last_status      = resp->status;
 	st->last_value       = value;
@@ -1657,6 +1952,41 @@ static int wfb_send_set_fec(const Config *cfg, int k, int n)
 	                   (const struct sockaddr*)&dst, sizeof(dst));
 	close(fd);
 	return (s == CMD_REQ_SET_FEC_LEN) ? 0 : -1;
+}
+
+static int wfb_get_fec(const Config *cfg, int *k_out, int *n_out, int *to_out)
+{
+	struct sockaddr_in dst;
+	if (resolve_ipv4(cfg->wfb_host, cfg->wfb_port, &dst) != 0) return -1;
+	int fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0) return -1;
+
+	uint32_t req_id = g_req_id++;
+	CmdReq req = {0};
+	req.req_id = htonl(req_id);
+	req.cmd_id = CMD_GET_FEC;
+
+	if (sendto(fd, &req, CMD_REQ_HEADER, 0,
+	           (const struct sockaddr*)&dst, sizeof(dst)) != CMD_REQ_HEADER) {
+		close(fd);
+		return -1;
+	}
+
+	struct pollfd p = { .fd = fd, .events = POLLIN };
+	int pr = poll(&p, 1, 300);
+	if (pr <= 0) { close(fd); return -1; }
+
+	CmdResp resp = {0};
+	ssize_t n = recv(fd, &resp, sizeof(resp), 0);
+	close(fd);
+	if (n < (ssize_t)(sizeof(uint32_t) * 2 + 4)) return -1;
+	if (ntohl(resp.req_id) != req_id) return -1;
+	if (ntohl(resp.rc) != 0) return -1;
+
+	if (k_out)  *k_out  = resp.u.get_fec.k;
+	if (n_out)  *n_out  = resp.u.get_fec.n;
+	if (to_out) *to_out = ntohs(resp.u.get_fec.fec_timeout_ms);
+	return 0;
 }
 
 static int wfb_get_radio(const Config *cfg, RadioBody *out)
@@ -2289,13 +2619,23 @@ static const TunableDesc TUNABLES[] = {
 	{"cmd.enabled",          SUB_COMMON, TF_BOOL, OFF_CMD(enabled),          0, 0,      "enable venc command proxy on rx_ant socket"},
 	{"cmd.loopback_only",    SUB_COMMON, TF_BOOL, OFF_CMD(loopback_only),    0, 0,      "reject WCMD requests not from 127.0.0.1"},
 	{"cmd.rate_limit_ms",    SUB_COMMON, TF_INT,  OFF_CMD(rate_limit_ms),    0, 60000,  "min ms between same-key applies (0 disables)"},
-	{"cmd.allow_keys_mask",  SUB_COMMON, TF_INT,  OFF_CMD(allow_keys_mask),  0, 0xFFFF, "bitmask of WCMD_KEY_* allowed (1=br,2=fps,4=pl,8=idr)"},
+	{"cmd.allow_keys_mask",  SUB_COMMON, TF_INT,  OFF_CMD(allow_keys_mask),  0, 0xFFFF, "bitmask of WCMD_KEY_* allowed (1=br,2=fps,4=pl,8=idr,16=fec_k,32=fec_n,64=mcs,128=bw,256=ldpc,512=stbc,1024=sgi,2048=fec_en,4096=mcs_en,8192=txpower,16384=record)"},
 	{"cmd.bitrate_min_kbps", SUB_COMMON, TF_INT,  OFF_CMD(bitrate_min_kbps), 1, 200000, "min accepted bitrate kbps (fallback when fec disabled)"},
 	{"cmd.bitrate_max_kbps", SUB_COMMON, TF_INT,  OFF_CMD(bitrate_max_kbps), 1, 200000, "max accepted bitrate kbps (fallback when fec disabled)"},
 	{"cmd.fps_min",          SUB_COMMON, TF_INT,  OFF_CMD(fps_min),          1, 240,    "min accepted fps"},
 	{"cmd.fps_max",          SUB_COMMON, TF_INT,  OFF_CMD(fps_max),          1, 240,    "max accepted fps"},
 	{"cmd.payload_min",      SUB_COMMON, TF_INT,  OFF_CMD(payload_min),      256, 4000, "min accepted RTP payload bytes"},
 	{"cmd.payload_max",      SUB_COMMON, TF_INT,  OFF_CMD(payload_max),      256, 4000, "max accepted RTP payload bytes"},
+	{"cmd.wfb_fec_k_min",    SUB_COMMON, TF_INT,  OFF_CMD(wfb_fec_k_min),    1, 256, "min accepted wfb_tx FEC k"},
+	{"cmd.wfb_fec_k_max",    SUB_COMMON, TF_INT,  OFF_CMD(wfb_fec_k_max),    1, 256, "max accepted wfb_tx FEC k"},
+	{"cmd.wfb_fec_n_min",    SUB_COMMON, TF_INT,  OFF_CMD(wfb_fec_n_min),    1, 256, "min accepted wfb_tx FEC n"},
+	{"cmd.wfb_fec_n_max",    SUB_COMMON, TF_INT,  OFF_CMD(wfb_fec_n_max),    1, 256, "max accepted wfb_tx FEC n"},
+	{"cmd.wfb_mcs_min",      SUB_COMMON, TF_INT,  OFF_CMD(wfb_mcs_min),      0, 31,  "min accepted wfb_tx MCS index"},
+	{"cmd.wfb_mcs_max",      SUB_COMMON, TF_INT,  OFF_CMD(wfb_mcs_max),      0, 31,  "max accepted wfb_tx MCS index"},
+	{"cmd.wfb_bandwidth_min",SUB_COMMON, TF_INT,  OFF_CMD(wfb_bandwidth_min),5, 80,  "min accepted wfb_tx bandwidth (MHz)"},
+	{"cmd.wfb_bandwidth_max",SUB_COMMON, TF_INT,  OFF_CMD(wfb_bandwidth_max),5, 80,  "max accepted wfb_tx bandwidth (MHz)"},
+	{"cmd.wfb_txpower_min",  SUB_COMMON, TF_INT,  OFF_CMD(wfb_txpower_min),  1, 4000,"min accepted iw txpower (mBm; 100=1 dBm)"},
+	{"cmd.wfb_txpower_max",  SUB_COMMON, TF_INT,  OFF_CMD(wfb_txpower_max),  1, 4000,"max accepted iw txpower (mBm; 100=1 dBm)"},
 };
 #define TUNABLES_COUNT (sizeof(TUNABLES) / sizeof(TUNABLES[0]))
 
@@ -2820,12 +3160,18 @@ static int cmd_status_to_json(const ApiSnapshot *s, char *buf, size_t cap)
 			"\"rejected_format\":%llu,\"rejected_disabled\":%llu,"
 			"\"rejected_unknown\":%llu,\"rejected_blocked\":%llu,"
 			"\"rejected_range\":%llu,\"rejected_rate\":%llu,"
-			"\"rejected_peer\":%llu,\"http_errors\":%llu"
+			"\"rejected_peer\":%llu,\"http_errors\":%llu,"
+			"\"coalesced_burst\":%llu"
 		"},"
 		"\"last\":{\"status\":%u,\"key\":%u,\"value\":%d,\"http_status\":%d,\"recv_age_s\":%.3f},"
 		"\"last_apply_age_s\":{"
 			"\"bitrate\":%.3f,\"fps\":%.3f,"
-			"\"payload\":%.3f,\"force_idr\":%.3f"
+			"\"payload\":%.3f,\"force_idr\":%.3f,"
+			"\"wfb_fec_k\":%.3f,\"wfb_fec_n\":%.3f,"
+			"\"wfb_mcs\":%.3f,\"wfb_bandwidth\":%.3f,"
+			"\"wfb_ldpc\":%.3f,\"wfb_stbc\":%.3f,\"wfb_short_gi\":%.3f,"
+			"\"fec_enabled\":%.3f,\"mcs_enabled\":%.3f,"
+			"\"wfb_txpower\":%.3f,\"record\":%.3f"
 		"}}",
 		log_rel_s(),
 		(w ? "true" : "false"),
@@ -2843,6 +3189,7 @@ static int cmd_status_to_json(const ApiSnapshot *s, char *buf, size_t cap)
 		w ? (unsigned long long)w->rejected_rate    : 0ULL,
 		w ? (unsigned long long)w->rejected_peer    : 0ULL,
 		w ? (unsigned long long)w->http_errors      : 0ULL,
+		w ? (unsigned long long)w->coalesced_burst  : 0ULL,
 		w ? (unsigned)w->last_status : 0u,
 		w ? (unsigned)w->last_key    : 0u,
 		w ? w->last_value : 0,
@@ -2851,7 +3198,18 @@ static int cmd_status_to_json(const ApiSnapshot *s, char *buf, size_t cap)
 		last_apply_age[WCMD_KEY_BITRATE_KBPS],
 		last_apply_age[WCMD_KEY_FPS],
 		last_apply_age[WCMD_KEY_PAYLOAD_BYTES],
-		last_apply_age[WCMD_KEY_FORCE_IDR]);
+		last_apply_age[WCMD_KEY_FORCE_IDR],
+		last_apply_age[WCMD_KEY_WFB_FEC_K],
+		last_apply_age[WCMD_KEY_WFB_FEC_N],
+		last_apply_age[WCMD_KEY_WFB_MCS],
+		last_apply_age[WCMD_KEY_WFB_BANDWIDTH],
+		last_apply_age[WCMD_KEY_WFB_LDPC],
+		last_apply_age[WCMD_KEY_WFB_STBC],
+		last_apply_age[WCMD_KEY_WFB_SHORT_GI],
+		last_apply_age[WCMD_KEY_FEC_ENABLED],
+		last_apply_age[WCMD_KEY_MCS_ENABLED],
+		last_apply_age[WCMD_KEY_WFB_TXPOWER],
+		last_apply_age[WCMD_KEY_RECORD]);
 	if (n < 0 || (size_t)n >= cap) return -1;
 	return n;
 }
@@ -3616,13 +3974,30 @@ static void config_defaults(Config *c)
 	c->cmd.enabled         = true;
 	c->cmd.loopback_only   = false;
 	c->cmd.rate_limit_ms   = 100;
-	c->cmd.allow_keys_mask = 0x0F;
+	c->cmd.allow_keys_mask = 0x7FFF;     /* keys 1..15 enabled */
 	c->cmd.bitrate_min_kbps = 100;
 	c->cmd.bitrate_max_kbps = 25000;
 	c->cmd.fps_min          = 1;
 	c->cmd.fps_max          = 240;
 	c->cmd.payload_min      = 576;
 	c->cmd.payload_max      = 1474;
+	/* wfb_tx side ranges.  k <= n is enforced at dispatch time after a
+	 * GET_FEC merge, so the per-key clamp here is just a coarse sanity
+	 * filter to reject obviously bad values from a confused operator. */
+	c->cmd.wfb_fec_k_min     = 1;
+	c->cmd.wfb_fec_k_max     = 64;
+	c->cmd.wfb_fec_n_min     = 1;
+	c->cmd.wfb_fec_n_max     = 96;
+	c->cmd.wfb_mcs_min       = 0;
+	c->cmd.wfb_mcs_max       = 11;
+	c->cmd.wfb_bandwidth_min = 5;
+	c->cmd.wfb_bandwidth_max = 80;
+	/* TX power range in mBm (millibel-milliwatts). 50..3000 covers the
+	 * regulatory/hardware envelope of all supported adapters; the iw
+	 * driver itself will clip to the per-channel max. */
+	c->cmd.wfb_txpower_min   = 50;
+	c->cmd.wfb_txpower_max   = 3000;
+	c->cmd.wfb_iface[0]      = '\0';
 }
 
 /* ─────────────────────────────────────────────────────────────────────
@@ -3657,6 +4032,8 @@ int main(int argc, char **argv)
 		/* csa */
 		OPT_CSA_IFACE, OPT_CSA_ALLOWLIST, OPT_CSA_BANDWIDTH,
 		OPT_CSA_COOLDOWN, OPT_CSA_NO_REVERT,
+		/* cmd */
+		OPT_WFB_IFACE,
 	};
 	static const struct option longopts[] = {
 		{"wfb",            required_argument, 0, OPT_WFB},
@@ -3715,6 +4092,7 @@ int main(int argc, char **argv)
 		{"csa-bandwidth",  required_argument, 0, OPT_CSA_BANDWIDTH},
 		{"csa-cooldown-ms",required_argument, 0, OPT_CSA_COOLDOWN},
 		{"csa-no-revert",  no_argument,       0, OPT_CSA_NO_REVERT},
+		{"wfb-iface",      required_argument, 0, OPT_WFB_IFACE},
 		{"verbose",        no_argument,       0, 'v'},
 		{"help",           no_argument,       0, 'h'},
 		{0, 0, 0, 0},
@@ -3866,6 +4244,10 @@ int main(int argc, char **argv)
 			break;
 		case OPT_CSA_NO_REVERT:
 			cfg.csa.no_revert = true;
+			break;
+		case OPT_WFB_IFACE:
+			snprintf(cfg.cmd.wfb_iface, sizeof(cfg.cmd.wfb_iface),
+			         "%s", optarg);
 			break;
 		case 'v':                cfg.verbose = 1; break;
 		case 'h': default: usage(argv[0]); return (ch == 'h') ? 0 : 1;

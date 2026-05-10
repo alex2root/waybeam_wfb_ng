@@ -1,0 +1,936 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>waybeam_gs</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=DM+Sans:wght@400;500;600;700&display=swap');
+
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --bg:#0a0a12;--bg2:#0f1019;--card:#141520;--card-hover:#191a2a;
+  --border:#1e2035;--border-hi:#2a2d4a;
+  --text:#c8cad0;--text-dim:#6b6e7a;--text-bright:#eef0f4;
+  --accent:#e94560;--accent-glow:rgba(233,69,96,.15);
+  --live:#22c55e;--live-bg:rgba(34,197,94,.1);
+  --warn:#f59e0b;--warn-bg:rgba(245,158,11,.1);
+  --bad:#ef4444;--bad-bg:rgba(239,68,68,.1);
+  --blue:#3b82f6;--blue-bg:rgba(59,130,246,.1);
+}
+html{font-size:13px}
+body{background:var(--bg);color:var(--text);font-family:'DM Sans',system-ui,sans-serif;min-height:100vh;overflow-x:hidden}
+code,pre,.mono{font-family:'JetBrains Mono',monospace;font-size:.85em}
+
+/* Telemetry Bar */
+.tbar{position:sticky;top:0;z-index:100;background:var(--bg2);border-bottom:1px solid var(--border);padding:0 1.2rem;height:44px;display:flex;align-items:center;gap:1rem;backdrop-filter:blur(12px)}
+.tbar-title{font-family:'JetBrains Mono',monospace;font-weight:700;font-size:1rem;color:var(--text-bright);letter-spacing:-.02em;white-space:nowrap}
+.tbar-title span{color:var(--accent);font-weight:400}
+.tbar-sep{width:1px;height:20px;background:var(--border)}
+.tbar-item{display:flex;align-items:center;gap:.4rem;font-size:.8rem;color:var(--text-dim);white-space:nowrap}
+.tbar-item b{color:var(--text);font-weight:600}
+.tbar-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+.tbar-dot.on{background:var(--live);box-shadow:0 0 8px rgba(34,197,94,.5);animation:pulse-dot 2s ease infinite}
+.tbar-dot.off{background:var(--text-dim);opacity:.4}
+.tbar-dot.bad{background:var(--bad);box-shadow:0 0 8px var(--bad)}
+.tbar-dot.warn{background:var(--warn);box-shadow:0 0 8px rgba(245,158,11,.5)}
+@keyframes pulse-dot{0%,100%{opacity:1}50%{opacity:.5}}
+.tbar-right{margin-left:auto;display:flex;align-items:center;gap:.8rem}
+.tbar-btn{background:none;border:1px solid var(--border);color:var(--text-dim);padding:4px 10px;border-radius:4px;cursor:pointer;font-size:.75rem;font-family:'JetBrains Mono',monospace;transition:all .15s}
+.tbar-btn:hover{border-color:var(--text-dim);color:var(--text)}
+
+/* Tabs */
+.tabs{display:flex;background:var(--bg2);border-bottom:1px solid var(--border);padding:0 1.2rem;gap:0}
+.tab{padding:.7rem 1.2rem;cursor:pointer;color:var(--text-dim);font-weight:500;font-size:.85rem;border-bottom:2px solid transparent;transition:all .15s;user-select:none}
+.tab:hover{color:var(--text)}
+.tab.active{color:var(--accent);border-bottom-color:var(--accent)}
+.tab-content{display:none;padding:1.2rem;max-width:1100px;margin:0 auto}
+.tab-content.active{display:block;animation:fadeIn .2s ease}
+@keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+
+/* Tunnels Tab */
+.tunnel-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:.8rem}
+.tunnel{background:var(--card);border:1px solid var(--border);border-radius:6px;overflow:hidden;transition:border-color .15s}
+.tunnel:hover{border-color:var(--border-hi)}
+.tunnel-head{display:flex;align-items:center;gap:.6rem;padding:.7rem 1rem;border-bottom:1px solid var(--border);background:var(--bg2)}
+.tunnel-name{font-family:'JetBrains Mono',monospace;font-weight:700;font-size:.95rem;color:var(--text-bright);flex:1}
+.role-badge{font-size:.65rem;padding:2px 7px;border-radius:3px;font-weight:600;font-family:'JetBrains Mono',monospace;letter-spacing:.04em;text-transform:uppercase}
+.role-rx{color:var(--blue);background:var(--blue-bg);border:1px solid var(--blue)}
+.role-tx{color:var(--accent);background:var(--accent-glow);border:1px solid var(--accent)}
+.state-badge{font-size:.65rem;padding:2px 7px;border-radius:3px;font-weight:600;font-family:'JetBrains Mono',monospace;letter-spacing:.04em;text-transform:uppercase}
+.state-running{color:var(--live);background:var(--live-bg);border:1px solid var(--live)}
+.state-backoff{color:var(--warn);background:var(--warn-bg);border:1px solid var(--warn)}
+.state-stopped{color:var(--text-dim);background:var(--bg);border:1px solid var(--border-hi)}
+.state-failed,.state-starting{color:var(--accent);background:var(--accent-glow);border:1px solid var(--accent)}
+.tunnel-body{padding:.7rem 1rem}
+.tunnel-kv{display:grid;grid-template-columns:auto 1fr;gap:3px 1rem;font-size:.78rem;margin-bottom:.6rem}
+.tunnel-kv dt{color:var(--text-dim);font-family:'JetBrains Mono',monospace}
+.tunnel-kv dd{margin:0;color:var(--text);font-variant-numeric:tabular-nums;font-family:'JetBrains Mono',monospace}
+.stats-panel{margin:.4rem 0 .6rem;padding:.5rem .7rem;background:var(--bg2);border:1px solid var(--border);border-radius:4px}
+.stats-panel.stats-empty{opacity:.55}
+.stats-head{display:flex;align-items:center;gap:.5rem;font-size:.7rem;letter-spacing:.06em;text-transform:uppercase;color:var(--text-dim);margin-bottom:.35rem;font-family:'JetBrains Mono',monospace}
+.stats-grid{margin-bottom:0;font-size:.74rem}
+.tunnel-actions{display:flex;gap:.4rem;flex-wrap:wrap}
+.btn-mini{padding:3px 10px;border-radius:4px;cursor:pointer;font-size:.72rem;font-weight:600;font-family:'JetBrains Mono',monospace;border:1px solid var(--border);background:var(--bg);color:var(--text);transition:all .15s;text-transform:uppercase;letter-spacing:.04em}
+.btn-mini:hover:not(:disabled){border-color:var(--text-dim);color:var(--text-bright)}
+.btn-mini:disabled{opacity:.35;cursor:not-allowed}
+.btn-start{color:var(--live);border-color:var(--live)}
+.btn-start:hover:not(:disabled){background:var(--live-bg)}
+.btn-stop{color:var(--warn);border-color:var(--warn)}
+.btn-stop:hover:not(:disabled){background:var(--warn-bg)}
+.btn-restart{color:var(--accent);border-color:var(--accent)}
+.btn-restart:hover:not(:disabled){background:var(--accent-glow)}
+
+/* Sections */
+.section{background:var(--card);border:1px solid var(--border);border-radius:6px;margin-bottom:.8rem;overflow:hidden}
+.section-header{display:flex;align-items:center;padding:.6rem 1rem;gap:.5rem;border-bottom:1px solid var(--border);background:var(--bg2)}
+.section-header h3{font-size:.85rem;font-weight:600;color:var(--text-bright);flex:1}
+.section-header .help{font-size:.7rem;color:var(--text-dim)}
+.section-body{padding:.8rem 1rem}
+
+/* Controls form */
+.field{display:grid;grid-template-columns:160px 1fr auto;align-items:center;padding:.4rem 0;gap:.8rem;border-bottom:1px solid var(--border)}
+.field:last-child{border-bottom:none}
+.field-label{font-size:.78rem;color:var(--text);font-family:'JetBrains Mono',monospace}
+.field-label .help{display:block;font-size:.7rem;color:var(--text-dim);margin-top:1px;font-family:'DM Sans',sans-serif}
+input[type="text"],input[type="number"],select{
+  background:var(--bg);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:4px;font-size:.8rem;font-family:'JetBrains Mono',monospace;width:100%;max-width:200px;transition:border-color .15s
+}
+input:focus,select:focus{outline:none;border-color:var(--accent)}
+input[type="number"]{-moz-appearance:textfield}
+input[type="number"]::-webkit-outer-spin-button,input[type="number"]::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
+select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%236b6e7a'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 8px center;padding-right:24px}
+.btn{padding:.45rem 1rem;border:none;border-radius:5px;cursor:pointer;font-size:.78rem;font-weight:600;transition:all .15s;font-family:'DM Sans',sans-serif}
+.btn:disabled{opacity:.35;cursor:not-allowed}
+.btn-apply{background:var(--live);color:#000}
+.btn-apply:hover:not(:disabled){background:#16a34a;transform:translateY(-1px)}
+.btn-fire{background:var(--accent);color:#fff}
+.btn-fire:hover:not(:disabled){background:#d63b54;transform:translateY(-1px)}
+
+/* Compact key/value grid for combined cards (label : input pairs).
+ * Inputs all line up against a fixed-width label column. */
+.kv-grid{display:grid;grid-template-columns:160px 200px;gap:.4rem .8rem;
+         align-items:center;padding:.4rem 0;font-family:'JetBrains Mono',monospace}
+.kv-grid label{font-size:.78rem;color:var(--text);font-family:'JetBrains Mono',monospace}
+.kv-grid label .help{display:block;font-size:.7rem;color:var(--text-dim);margin-top:1px;font-family:'DM Sans',sans-serif}
+.kv-grid input,.kv-grid select{max-width:200px}
+
+/* Subsection heading inside a card. */
+.subhead{margin:.8rem 0 .2rem 0;font-size:.78rem;font-weight:600;
+         color:var(--text-bright);font-family:'JetBrains Mono',monospace}
+
+/* Left-aligned action-button row. */
+.action-row{display:flex;gap:.5rem;justify-content:flex-start;
+            align-items:center;flex-wrap:wrap;padding:.5rem 0 .2rem 0}
+
+/* Result/last-reply pane */
+.reply{background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:.5rem .8rem;margin-top:.5rem;font-family:'JetBrains Mono',monospace;font-size:.75rem;color:var(--text);white-space:pre-wrap;word-break:break-all;min-height:1.4em}
+.reply.ok{border-left:3px solid var(--live)}
+.reply.err{border-left:3px solid var(--bad)}
+
+/* Toast */
+.toast-container{position:fixed;top:52px;right:1rem;z-index:200;display:flex;flex-direction:column;gap:.4rem}
+.toast{padding:.5rem 1rem;border-radius:5px;font-size:.8rem;color:#fff;animation:toastIn .3s ease,toastOut .3s ease 2.7s forwards;max-width:360px;font-weight:500;border-left:3px solid}
+.toast-ok{background:rgba(34,197,94,.15);border-left-color:var(--live);color:var(--live)}
+.toast-err{background:rgba(239,68,68,.15);border-left-color:var(--bad);color:var(--bad)}
+@keyframes toastIn{from{opacity:0;transform:translateX(20px)}to{opacity:1;transform:none}}
+@keyframes toastOut{to{opacity:0;transform:translateX(20px)}}
+
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-track{background:var(--bg)}
+::-webkit-scrollbar-thumb{background:var(--border-hi);border-radius:3px}
+::-webkit-scrollbar-thumb:hover{background:var(--text-dim)}
+
+.muted{color:var(--text-dim)}
+.empty{color:var(--text-dim);text-align:center;padding:2rem;font-size:.85rem;border:1px dashed var(--border);border-radius:6px}
+</style>
+</head>
+<body>
+
+<div class="tbar">
+  <div class="tbar-title">waybeam<span>_gs</span></div>
+  <div class="tbar-sep"></div>
+  <div class="tbar-item">uptime <b id="tbar-up">-</b></div>
+  <div class="tbar-item">tunnels <b id="tbar-tunnels">-</b></div>
+  <div class="tbar-item"><div class="tbar-dot off" id="tbar-conn"></div><span id="tbar-conn-label">connecting</span></div>
+  <div class="tbar-right">
+    <button class="tbar-btn" onclick="systemReinit()" title="Tear down all tunnels, run system.down + system.up, respawn — last-resort recovery for adapters stuck in a bad state (e.g. txpower=-100 dBm after monitor mode flip).">Reinit</button>
+    <button class="tbar-btn" onclick="manualRefresh()">Refresh</button>
+  </div>
+</div>
+
+<div class="tabs">
+  <div class="tab active" data-tab="tunnels">Tunnels</div>
+  <div class="tab" data-tab="control">GS Control</div>
+  <div class="tab" data-tab="cmd">Vehicle Control</div>
+</div>
+
+<div class="toast-container" id="toasts"></div>
+
+<!-- Tunnels -->
+<div class="tab-content active" id="tab-tunnels">
+  <div id="tunnel-grid" class="tunnel-grid"></div>
+</div>
+
+<!-- Control (wfb_cmd passthrough) -->
+<div class="tab-content" id="tab-control">
+  <!-- Channel scan (passive, no vehicle cooperation) -->
+  <div class="section">
+    <div class="section-header"><h3>Channel scan</h3>
+      <span class="help">Cycle the GS adapter(s) through a channel list, dwelling on each combo. Stops on the first one where wfb_rx successfully decrypts a packet — the vehicle is on that channel. Vehicle does not need to cooperate.</span></div>
+    <div class="section-body">
+      <div class="field">
+        <div class="field-label">ifaces <span class="help">copies the same selection used in CSA</span></div>
+        <select id="scan-iface" multiple size="3" style="width:100%"></select>
+      </div>
+      <div class="field">
+        <div class="field-label">chans <span class="help">comma-separated channel list</span></div>
+        <input type="text" id="scan-chans" value="36,40,44,48,52,56,60,64,149,153,157,161,165">
+      </div>
+      <div class="field">
+        <div class="field-label">ht</div>
+        <select id="scan-ht">
+          <option value="HT20" selected>HT20 (all)</option>
+          <option value="HT40+">HT40+ (all)</option>
+          <option value="HT40-">HT40- (all)</option>
+        </select>
+      </div>
+      <div class="field">
+        <div class="field-label">dwell_ms <span class="help">600–1000 ms is typical for RTL88x2</span></div>
+        <input type="number" id="scan-dwell" value="800" min="200" max="10000">
+      </div>
+      <div class="action-row">
+        <button class="btn btn-fire" onclick="scanFire()">Start scan</button>
+        <button class="btn btn-stop" onclick="scanCancel()">Cancel</button>
+      </div>
+      <div class="reply" id="reply-scan"></div>
+      <div class="muted" id="scan-state" style="margin-top:.4rem">scan idle</div>
+    </div>
+  </div>
+
+  <!-- GS adapter txpower (per-iface iw set txpower fixed) -->
+  <div class="section">
+    <div class="section-header"><h3>GS adapter txpower</h3>
+      <span class="help">Per-iface <code>iw set txpower fixed &lt;mBm&gt;</code> on this host. 100 mBm = 1 dBm. Useful when an adapter dropped to txpower=-100 after a monitor-mode flip.</span></div>
+    <div class="section-body" id="gs-txpower-row" style="display:flex;gap:.5rem;flex-wrap:wrap">
+      <span class="muted">Loading ifaces…</span>
+    </div>
+    <div class="reply" id="reply-gs-txpower"></div>
+  </div>
+
+  <!-- Local wfb_tx control: target + FEC + Radio combined into one card.
+       All input rows share a single 2-column grid (label : input) so the
+       inputs line up vertically; action buttons are left-aligned in their
+       own row beneath each subsection. -->
+  <div class="section">
+    <div class="section-header"><h3>Local wfb_tx (uplink) — fec / radio</h3>
+      <span class="help">Direct wfb_cmd into the GS-side tx tunnel's control_port. Affects this ground-side TX only; vehicle RX adapts to whatever it sees.</span></div>
+    <div class="section-body">
+      <div class="field">
+        <div class="field-label">Tunnel <span class="help">Only tx tunnels with control_port set are valid targets.</span></div>
+        <select id="ctrl-tunnel"></select>
+        <span></span>
+      </div>
+
+      <h4 class="subhead">FEC (set_fec / get_fec)</h4>
+      <div class="kv-grid">
+        <label for="fec-k">k <span class="help">data shards per FEC block</span></label>
+        <input type="number" id="fec-k" min="1" max="255" value="1">
+
+        <label for="fec-n">n <span class="help">total shards (k + parity)</span></label>
+        <input type="number" id="fec-n" min="1" max="255" value="2">
+
+        <label for="fec-to">timeout_ms <span class="help">empty = leave running value</span></label>
+        <input type="number" id="fec-to" min="0" max="65534" placeholder="(keep)">
+      </div>
+      <div class="action-row">
+        <button class="btn btn-fire"  onclick="ctrlGetFec()">Get FEC</button>
+        <button class="btn btn-apply" onclick="ctrlSetFec()">Set FEC</button>
+      </div>
+      <div class="reply" id="reply-fec"></div>
+
+      <h4 class="subhead">Radio (set_radio / get_radio)</h4>
+      <div class="kv-grid">
+        <label for="r-stbc">stbc</label>      <input type="number" id="r-stbc" min="0" max="3" value="0">
+        <label for="r-ldpc">ldpc</label>      <input type="number" id="r-ldpc" min="0" max="1" value="0">
+        <label for="r-sgi">short_gi</label>   <input type="number" id="r-sgi"  min="0" max="1" value="0">
+        <label for="r-bw">bandwidth (MHz)</label> <input type="number" id="r-bw" min="5" max="80" value="20">
+        <label for="r-mcs">mcs_index</label>  <input type="number" id="r-mcs"  min="0" max="31" value="1">
+        <label for="r-vhtm">vht_mode</label>  <input type="number" id="r-vhtm" min="0" max="1" value="0">
+        <label for="r-vhtn">vht_nss</label>   <input type="number" id="r-vhtn" min="1" max="4" value="1">
+      </div>
+      <div class="action-row">
+        <button class="btn btn-fire"  onclick="ctrlGetRadio()">Get Radio</button>
+        <button class="btn btn-apply" onclick="ctrlSetRadio()">Set Radio</button>
+      </div>
+      <div class="reply" id="reply-radio"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Vehicle Control (WCMD: venc proxy + vehicle wfb_tx control + CSA) -->
+<div class="tab-content" id="tab-cmd">
+  <!-- Synchronized channel hop (CSA) — moved here because both ends must agree -->
+  <div class="section">
+    <div class="section-header"><h3>Synchronized channel hop (CSA)</h3>
+      <span class="help">Sends 5 <code>csa_commit</code> JSON frames to the vehicle over the uplink, then runs <code>iw set channel</code> locally at T_switch. Vehicle's csa_tick mirrors the same timing. Auto-revert if no rx traffic within t_revert_ms.</span></div>
+    <div class="section-body">
+      <div class="field">
+        <div class="field-label">ifaces <span class="help">GS-side adapter(s) to switch — pick one or more (Ctrl+click for multi)</span></div>
+        <select id="csa-iface" multiple size="3" style="width:100%"></select>
+      </div>
+      <div class="field">
+        <div class="field-label">target chan</div>
+        <input type="number" id="csa-chan" value="161" min="1" max="200">
+      </div>
+      <div class="field">
+        <div class="field-label">target ht</div>
+        <select id="csa-ht">
+          <option value="HT20">HT20</option>
+          <option value="HT40+">HT40+</option>
+          <option value="HT40-">HT40-</option>
+        </select>
+      </div>
+      <div class="field">
+        <div class="field-label">prev chan / ht <span class="help">used for auto-revert</span></div>
+        <div style="display:flex;gap:.4rem">
+          <input type="number" id="csa-prev-chan" value="161" min="1" max="200" style="width:6rem">
+          <select id="csa-prev-ht">
+            <option value="HT20">HT20</option>
+            <option value="HT40+">HT40+</option>
+            <option value="HT40-">HT40-</option>
+          </select>
+        </div>
+      </div>
+      <div class="field">
+        <div class="field-label">lead_ms</div>
+        <input type="number" id="csa-lead" value="500" min="100" max="5000">
+      </div>
+      <div class="field">
+        <div class="field-label">t_revert_ms</div>
+        <input type="number" id="csa-revert" value="3000" min="500" max="30000">
+      </div>
+      <div class="action-row">
+        <button class="btn btn-fire" onclick="csaFire()">Hop</button>
+        <label style="display:flex;align-items:center;gap:.3rem;font-size:.78rem;color:var(--text)"><input type="checkbox" id="csa-no-revert"> no_revert</label>
+      </div>
+      <div class="reply" id="reply-csa"></div>
+      <div class="muted" id="csa-state" style="margin-top:.4rem">phase: idle</div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-header"><h3>WCMD over uplink</h3>
+      <span class="help">Fire-and-forget. Vehicle's link_controller proxies venc keys to HTTP and wfb_* keys to wfb_cmd.</span></div>
+    <div class="section-body">
+      <div class="field">
+        <div class="field-label">key
+          <span class="help">force_idr ignores value</span></div>
+        <select id="cmd-key">
+          <optgroup label="venc">
+            <option value="bitrate_kbps">bitrate_kbps</option>
+            <option value="fps">fps</option>
+            <option value="payload_bytes">payload_bytes</option>
+            <option value="force_idr">force_idr</option>
+            <option value="record">record (1=start, 0=stop)</option>
+          </optgroup>
+          <optgroup label="vehicle wfb_tx (video link)">
+            <option value="wfb_fec_k">wfb_fec_k</option>
+            <option value="wfb_fec_n">wfb_fec_n</option>
+            <option value="wfb_mcs">wfb_mcs</option>
+            <option value="wfb_bandwidth">wfb_bandwidth</option>
+            <option value="wfb_ldpc">wfb_ldpc</option>
+            <option value="wfb_stbc">wfb_stbc</option>
+            <option value="wfb_short_gi">wfb_short_gi</option>
+            <option value="wfb_txpower">wfb_txpower</option>
+          </optgroup>
+          <optgroup label="vehicle adaptive switches">
+            <option value="fec_enabled">fec_enabled</option>
+            <option value="mcs_enabled">mcs_enabled</option>
+          </optgroup>
+        </select>
+        <span></span>
+      </div>
+      <div class="field">
+        <div class="field-label">value <span class="help">int32; ignored for force_idr; 0/1 for ldpc/stbc/short_gi</span></div>
+        <input type="number" id="cmd-value" placeholder="e.g. 4000">
+        <span></span>
+      </div>
+      <div class="action-row">
+        <button class="btn btn-fire" onclick="cmdFire()">Send</button>
+      </div>
+      <div class="reply" id="reply-cmd"></div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-header"><h3>Quick fires — venc</h3><span class="help">Common one-shots over the uplink to the encoder.</span></div>
+    <div class="section-body" style="display:flex;gap:.5rem;flex-wrap:wrap">
+      <button class="btn-mini btn-restart" onclick="cmdQuick('force_idr')">force_idr</button>
+      <button class="btn-mini btn-start" onclick="cmdQuick('record',1)">record start</button>
+      <button class="btn-mini btn-stop"  onclick="cmdQuick('record',0)">record stop</button>
+      <button class="btn-mini btn-start" onclick="cmdQuick('bitrate_kbps',2000)">bitrate 2 Mbps</button>
+      <button class="btn-mini btn-start" onclick="cmdQuick('bitrate_kbps',4000)">bitrate 4 Mbps</button>
+      <button class="btn-mini btn-start" onclick="cmdQuick('bitrate_kbps',8000)">bitrate 8 Mbps</button>
+      <button class="btn-mini btn-start" onclick="cmdQuick('fps',60)">fps 60</button>
+      <button class="btn-mini btn-start" onclick="cmdQuick('fps',120)">fps 120</button>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-header"><h3>Quick fires — adaptive switches</h3>
+      <span class="help">Pin the vehicle's FEC and/or MCS so manual wfb_* changes below stick. Re-enable to resume adaptation.</span></div>
+    <div class="section-body" style="display:flex;gap:.5rem;flex-wrap:wrap">
+      <button class="btn-mini btn-stop" onclick="cmdQuick('fec_enabled',0)">fec auto OFF</button>
+      <button class="btn-mini btn-start" onclick="cmdQuick('fec_enabled',1)">fec auto ON</button>
+      <button class="btn-mini btn-stop" onclick="cmdQuick('mcs_enabled',0)">mcs auto OFF</button>
+      <button class="btn-mini btn-start" onclick="cmdQuick('mcs_enabled',1)">mcs auto ON</button>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-header"><h3>Quick fires — vehicle wfb_tx</h3>
+      <span class="help">Vehicle's adaptive FEC and MCS will overwrite these on the next tick unless you turn the auto switches off above.</span></div>
+    <div class="section-body" style="display:flex;gap:.5rem;flex-wrap:wrap">
+      <button class="btn-mini btn-start" onclick="cmdQuick('wfb_mcs',1)">mcs 1</button>
+      <button class="btn-mini btn-start" onclick="cmdQuick('wfb_mcs',2)">mcs 2</button>
+      <button class="btn-mini btn-start" onclick="cmdQuick('wfb_mcs',3)">mcs 3</button>
+      <button class="btn-mini btn-start" onclick="cmdQuick('wfb_mcs',4)">mcs 4</button>
+      <button class="btn-mini btn-start" onclick="cmdQuick('wfb_bandwidth',20)">bw 20</button>
+      <button class="btn-mini btn-start" onclick="cmdQuick('wfb_bandwidth',40)">bw 40</button>
+      <button class="btn-mini btn-start" onclick="cmdQuick('wfb_fec_k',8)">fec k=8</button>
+      <button class="btn-mini btn-start" onclick="cmdQuick('wfb_fec_n',12)">fec n=12</button>
+      <button class="btn-mini btn-stop" onclick="cmdQuick('wfb_ldpc',0)">ldpc 0</button>
+      <button class="btn-mini btn-start" onclick="cmdQuick('wfb_ldpc',1)">ldpc 1</button>
+      <button class="btn-mini btn-stop" onclick="cmdQuick('wfb_short_gi',0)">sgi 0</button>
+      <button class="btn-mini btn-start" onclick="cmdQuick('wfb_short_gi',1)">sgi 1</button>
+      <button class="btn-mini btn-start" onclick="cmdQuick('wfb_txpower',500)">txp 5 dBm</button>
+      <button class="btn-mini btn-start" onclick="cmdQuick('wfb_txpower',1500)">txp 15 dBm</button>
+      <button class="btn-mini btn-start" onclick="cmdQuick('wfb_txpower',2000)">txp 20 dBm</button>
+      <button class="btn-mini btn-start" onclick="cmdQuick('wfb_txpower',2500)">txp 25 dBm</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const $=s=>document.querySelector(s);
+const $$=s=>document.querySelectorAll(s);
+
+/* Escape a value for safe interpolation into HTML element content or
+ * attribute strings. Tunnel/iface names come from the supervisor's
+ * config (root-edited), so the blast radius is small, but we still
+ * round-trip everything through this so a config typo can't break
+ * page rendering or smuggle a closing-script tag into innerHTML.
+ *
+ * (Don't write that tag literally inside a JS comment — the HTML
+ * tokenizer scans script bodies for `<` followed by `/script>` and
+ * closes the script element early, leaving the rest of this file as
+ * stray markup.  That bit me; hence this note.) */
+function esc(v){
+  return String(v==null?'':v)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+/* Encode a value for use as a JS string literal inside an HTML attribute
+ * (e.g. onclick="foo('${jsAttr(name)}')"). JSON.stringify gives a
+ * well-quoted JS literal; HTML-escape the result so attribute parsing
+ * stays correct. Strip the surrounding quotes so the caller picks the
+ * matching quote style. */
+function jsAttr(v){
+  return esc(JSON.stringify(String(v==null?'':v)).slice(1,-1));
+}
+
+function fmtUptime(s){
+  s=Math.floor(s||0);
+  const d=Math.floor(s/86400),h=Math.floor((s%86400)/3600),m=Math.floor((s%3600)/60),ss=s%60;
+  if(d) return d+'d '+h+'h';
+  if(h) return h+'h '+m+'m';
+  if(m) return m+'m '+ss+'s';
+  return ss+'s';
+}
+
+function toast(msg, kind){
+  const t=document.createElement('div');
+  t.className='toast toast-'+(kind||'ok');
+  t.textContent=msg;
+  $('#toasts').appendChild(t);
+  setTimeout(()=>t.remove(),3000);
+}
+
+let lastTunnels=[];
+async function refresh(){
+  try{
+    const r=await fetch('/api/v1/status');
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    const j=await r.json();
+    $('#tbar-up').textContent=fmtUptime(j.uptime_s);
+    $('#tbar-tunnels').textContent=(j.tunnels||[]).length;
+    setConn(true);
+    // pull /tunnels for full detail
+    const r2=await fetch('/api/v1/tunnels');
+    const tj=await r2.json();
+    lastTunnels=tj;
+    renderTunnels(tj);
+    populateCtrlTunnels(tj);
+    // /api/v1/ifaces returns the current chan/ht/txpower per adapter.
+    let ij=[];
+    try{
+      const ri=await fetch('/api/v1/ifaces');
+      ij=await ri.json();
+    }catch(e){}
+    lastIfaces=ij;
+    renderGsTxpowerRow(tj, ij);
+    populateCsaIfaceSelect(tj, ij);
+    populateScanIfaceSelect(tj, ij);
+    refreshCsaState();
+    refreshScanState();
+  }catch(e){
+    setConn(false);
+  }
+}
+
+let lastIfaces=[];
+function ifaceLookup(name){
+  return (lastIfaces||[]).find(i=>i.name===name);
+}
+function ifaceLabel(name){
+  /* Returned as plain text; written into an <option> via .textContent
+   * (see populate{Csa,Scan}IfaceSelect) so HTML escaping is automatic.
+   * No esc() needed here. */
+  const s=ifaceLookup(name);
+  if(!s||s.chan<=0) return name+' [?]';
+  const dbm=(s.txpower_mbm>=0)?` ${(s.txpower_mbm/100).toFixed(0)} dBm`:'';
+  return `${name} [ch ${s.chan} ${s.ht||'?'}${dbm}]`;
+}
+
+function renderGsTxpowerRow(ts){
+  const row=$('#gs-txpower-row');
+  if(!row) return;
+  const seen=new Set();
+  const ifaces=[];
+  (ts||[]).forEach(t=>(t.interfaces||[]).forEach(i=>{
+    if(!seen.has(i)){ seen.add(i); ifaces.push(i); }
+  }));
+  if(!ifaces.length){
+    row.innerHTML='<span class="muted">no ifaces configured</span>';
+    return;
+  }
+  // For each iface, a label (with current state) + four mBm presets.
+  const presets=[500,1500,2000,2500];
+  let h='';
+  ifaces.forEach(i=>{
+    const s=ifaceLookup(i);
+    const cur=s && s.txpower_mbm>=0 ? `${(s.txpower_mbm/100).toFixed(0)} dBm` : '?';
+    const ch=s && s.chan>0 ? `ch ${s.chan} ${s.ht||''}` : 'ch ?';
+    h+=`<div style="display:flex;align-items:center;gap:.4rem;flex-wrap:wrap">`;
+    h+=`<code>${esc(i)}</code><span class="muted">${esc(ch)} · current ${esc(cur)}</span>`;
+    presets.forEach(m=>{
+      const dbm=(m/100).toFixed(0);
+      h+=`<button class="btn-mini btn-start" onclick="gsTxpower('${jsAttr(i)}',${m})">${dbm} dBm</button>`;
+    });
+    h+=`</div>`;
+  });
+  row.innerHTML=h;
+}
+
+async function gsTxpower(iface, mbm){
+  try{
+    const r=await fetch(`/api/v1/system/txpower?iface=${encodeURIComponent(iface)}&mbm=${mbm}`);
+    const j=await r.json();
+    setReply('#reply-gs-txpower', j, j.ok);
+    toast(`${iface} → ${(mbm/100).toFixed(0)} dBm: ${j.ok?'ok':'iw rc='+j.iw_rc}`, j.ok?'ok':'err');
+  }catch(e){ toast(`txpower failed: ${e.message||e}`,'err'); }
+}
+
+function populateCsaIfaceSelect(ts){
+  const sel=$('#csa-iface');
+  if(!sel) return;
+  const seen=new Set();
+  const ifaces=[];
+  (ts||[]).forEach(t=>(t.interfaces||[]).forEach(i=>{
+    if(!seen.has(i)){ seen.add(i); ifaces.push(i); }
+  }));
+  // Preserve current selection set if still present.
+  const cur=new Set(Array.from(sel.selectedOptions||[]).map(o=>o.value));
+  const wasFirst=sel.dataset.firstLoad!=='no';
+  sel.innerHTML='';
+  ifaces.forEach(i=>{
+    const o=document.createElement('option');
+    o.value=i;
+    o.textContent=ifaceLabel(i);
+    // First load: select all by default so the diversity case "just works".
+    if((cur.size===0 && wasFirst) || cur.has(i)) o.selected=true;
+    sel.appendChild(o);
+  });
+  if(wasFirst){
+    sel.dataset.firstLoad='no';
+    sel.addEventListener('change', csaAutofillPrev);
+    csaAutofillPrev();
+  }
+}
+
+/* Pull prev_chan/prev_ht from the first selected iface's current state.
+ * Runs:
+ *   - on first WebUI load (so the form starts truthy, not "always 161")
+ *   - on iface-selection change (so the revert target follows the
+ *     adapter you just clicked)
+ * Does NOT run on every refresh — that would clobber a deliberate
+ * operator edit between selection and clicking Hop. */
+function csaAutofillPrev(){
+  const sel=$('#csa-iface');
+  if(!sel) return;
+  const first=Array.from(sel.selectedOptions||[]).map(o=>o.value)[0];
+  if(!first) return;
+  const s=ifaceLookup(first);
+  if(!s||s.chan<=0) return;
+  const prev=$('#csa-prev-chan');
+  const prevHt=$('#csa-prev-ht');
+  if(prev) prev.value=s.chan;
+  if(prevHt && s.ht) prevHt.value=s.ht;
+}
+
+async function refreshCsaState(){
+  try{
+    const r=await fetch('/api/v1/csa');
+    const j=await r.json();
+    const phaseLabel=['idle','burst','armed','verify'][j.phase]||'?';
+    const el=$('#csa-state');
+    if(!el) return;
+    const ifs=(j.ifaces||[]).join(',');
+    if(j.phase===0){
+      el.textContent='phase: idle';
+    } else if(j.phase===1 || j.phase===2){
+      el.textContent=`phase: ${phaseLabel} sess=${j.sess} ifaces=[${ifs}] `+
+        `frames=${j.frames_sent}/${j.frames_total} `+
+        `T_switch in ${j.t_to_switch_ms.toFixed(0)} ms `+
+        `→ chan ${j.target_chan} ${j.target_ht}`;
+    } else {
+      el.textContent=`phase: ${phaseLabel} sess=${j.sess} ifaces=[${ifs}] `+
+        `T_revert in ${j.t_to_revert_ms.toFixed(0)} ms`;
+    }
+  }catch(e){}
+}
+
+function populateScanIfaceSelect(ts){
+  const sel=$('#scan-iface');
+  if(!sel) return;
+  const seen=new Set();
+  const ifaces=[];
+  (ts||[]).forEach(t=>(t.interfaces||[]).forEach(i=>{
+    if(!seen.has(i)){ seen.add(i); ifaces.push(i); }
+  }));
+  const cur=new Set(Array.from(sel.selectedOptions||[]).map(o=>o.value));
+  const wasFirst=sel.dataset.firstLoad!=='no';
+  sel.innerHTML='';
+  ifaces.forEach(i=>{
+    const o=document.createElement('option');
+    o.value=i;
+    o.textContent=ifaceLabel(i);
+    if((cur.size===0 && wasFirst) || cur.has(i)) o.selected=true;
+    sel.appendChild(o);
+  });
+  sel.dataset.firstLoad='no';
+}
+
+async function refreshScanState(){
+  try{
+    const r=await fetch('/api/v1/scan');
+    const j=await r.json();
+    const phaseLabel=['idle','running','found','stopped'][j.phase]||'?';
+    const el=$('#scan-state');
+    if(!el) return;
+    if(j.phase===0){
+      el.textContent='scan idle';
+    } else if(j.phase===1){
+      el.textContent=`scanning sess=${j.sess} step ${j.cur_step+1}/${j.step_count} `+
+        `→ ch ${j.cur_chan} ${j.cur_ht} (dwell ${j.dwell_left_ms.toFixed(0)} ms)`;
+    } else if(j.phase===2){
+      el.innerHTML=`<b>found</b> traffic on chan <b>${esc(j.found_chan)} ${esc(j.found_ht)}</b> `+
+        `after ${esc(j.hops_done)} hop(s) — adapters now on this channel`;
+    } else {
+      el.textContent=`scan stopped after ${j.hops_done} hop(s) — no traffic found`;
+    }
+  }catch(e){}
+}
+
+async function scanFire(){
+  const sel=$('#scan-iface');
+  const ifaceList=Array.from(sel.selectedOptions).map(o=>o.value);
+  const chans=$('#scan-chans').value.trim();
+  const ht=$('#scan-ht').value;
+  const dwell=parseInt($('#scan-dwell').value,10);
+  if(!ifaceList.length){ toast('select at least one iface','err'); return; }
+  if(!chans){ toast('chan list empty','err'); return; }
+  // Same trick as CSA: encode each token individually so the literal ','
+  // separators survive into the server's qs parser.
+  const ifacesParam=ifaceList.map(encodeURIComponent).join(',');
+  const chansParam=chans.split(',').map(s=>encodeURIComponent(s.trim())).join(',');
+  const qs=`iface=${ifacesParam}&chans=${chansParam}`+
+           `&ht=${encodeURIComponent(ht)}&dwell_ms=${dwell}`;
+  if(!confirm(`Scan ${ifaceList.length} iface(s) across [${chans}] @ ${dwell} ms each?\n\nVideo will drop until the vehicle's channel is found.`)) return;
+  try{
+    const r=await fetch(`/api/v1/system/scan?${qs}`);
+    const ctype=r.headers.get('content-type')||'';
+    let j;
+    if(ctype.includes('application/json')) j=await r.json();
+    else j={ok:r.ok, error:(await r.text()).trim(), http_status:r.status};
+    setReply('#reply-scan', j, j.ok);
+    toast(`scan ${j.ok?'started':'rejected'}: ${j.error||'sess='+j.sess}`, j.ok?'ok':'err');
+    refreshScanState();
+  }catch(e){ toast(`scan failed: ${e.message||e}`,'err'); }
+}
+
+async function scanCancel(){
+  try{
+    const r=await fetch('/api/v1/system/scan/cancel');
+    const j=await r.json();
+    toast(j.cancelled?'scan cancelled':'scan was idle', 'ok');
+    refreshScanState();
+  }catch(e){ toast(`cancel failed: ${e.message||e}`,'err'); }
+}
+
+async function csaFire(){
+  const sel=$('#csa-iface');
+  const ifaceList=Array.from(sel.selectedOptions).map(o=>o.value);
+  const chan=parseInt($('#csa-chan').value,10);
+  const ht=$('#csa-ht').value;
+  const prev_chan=parseInt($('#csa-prev-chan').value,10);
+  const prev_ht=$('#csa-prev-ht').value;
+  const lead_ms=parseInt($('#csa-lead').value,10);
+  const t_revert_ms=parseInt($('#csa-revert').value,10);
+  const no_revert=$('#csa-no-revert').checked?1:0;
+  if(!ifaceList.length){ toast('select at least one iface','err'); return; }
+  // Encode each iface, then join with literal ',' — encoding the comma
+  // would percent-escape it and the server's query parser splits on raw
+  // ',' to enumerate ifaces.
+  const ifacesParam=ifaceList.map(encodeURIComponent).join(',');
+  const ifacesLabel=ifaceList.join(',');
+  const qs=`iface=${ifacesParam}&chan=${chan}&ht=${encodeURIComponent(ht)}`+
+           `&prev_chan=${prev_chan}&prev_ht=${encodeURIComponent(prev_ht)}`+
+           `&lead_ms=${lead_ms}&t_revert_ms=${t_revert_ms}&no_revert=${no_revert}`;
+  if(!confirm(`Hop ${ifaceList.length} iface(s) [${ifacesLabel}] → chan ${chan} ${ht} (revert to ${prev_chan} ${prev_ht} in ${t_revert_ms} ms if no traffic)?\n\nVideo will drop briefly during the switch.`)) return;
+  try{
+    const r=await fetch(`/api/v1/system/csa?${qs}`);
+    const ctype=r.headers.get('content-type')||'';
+    let j;
+    if(ctype.includes('application/json')){
+      j=await r.json();
+    }else{
+      const txt=(await r.text()).trim();
+      j={ok:r.ok, error:txt, http_status:r.status};
+    }
+    setReply('#reply-csa', j, j.ok);
+    toast(`csa ${j.ok?'armed':'rejected'}: ${j.error||'sess='+j.sess}`, j.ok?'ok':'err');
+    refreshCsaState();
+  }catch(e){ toast(`csa failed: ${e.message||e}`,'err'); }
+}
+
+function setConn(ok){
+  const dot=$('#tbar-conn'), lbl=$('#tbar-conn-label');
+  dot.className='tbar-dot '+(ok?'on':'bad');
+  lbl.textContent=ok?'live':'offline';
+}
+
+function fmtUnset(v, label){
+  return v===undefined||v===null||v<0 ? `<span class="muted">${label||'unset'}</span>` : v;
+}
+function fmtRate(bytes, ms){
+  if(!bytes||!ms) return '-';
+  const bps = (bytes*8)*(1000/ms);
+  if(bps>=1e6) return (bps/1e6).toFixed(2)+' Mbps';
+  if(bps>=1e3) return (bps/1e3).toFixed(1)+' kbps';
+  return Math.round(bps)+' bps';
+}
+
+function renderTunnels(ts){
+  const g=$('#tunnel-grid');
+  if(!ts || !ts.length){ g.innerHTML='<div class="empty">no tunnels configured</div>'; return; }
+  g.innerHTML=ts.map(t=>{
+    const ifs=esc((t.interfaces||[]).join(', '));
+    const tname=esc(t.name);
+    const trole=esc(t.role);
+    const tstate=esc(t.state);
+    let detail, statsBlock='';
+    if(t.role==='rx'){
+      detail = `<dt>udp_out</dt><dd>${t.udp_out?esc(t.udp_out):'<span class="muted">(default 127.0.0.1:5600)</span>'}</dd>
+         <dt>stats_out</dt><dd>${t.stats_out?esc(t.stats_out):'<span class="muted">-</span>'}</dd>`;
+      const s=t.stats||{};
+      const live = s.msg_count>0;
+      const stale = !live || (s.age_ms!==undefined && s.age_ms>3000);
+      const dot = !live ? 'bad' : (stale ? 'warn' : 'on');
+      const dotLbl = !live ? 'no datagrams' : (stale ? `stale ${Math.round((s.age_ms||0)/1000)}s` : `${s.interval_ms||0} ms`);
+      const lossPct = (s.pkt_all>0) ? ((s.pkt_lost||0)*100/s.pkt_all) : 0;
+      statsBlock = `<div class="stats-panel ${live?'':'stats-empty'}">
+        <div class="stats-head">
+          <span class="tbar-dot ${dot}"></span>
+          <span>live</span>
+          <span class="muted">${dotLbl}</span>
+        </div>
+        <dl class="tunnel-kv stats-grid">
+          <dt>pkts</dt><dd>${s.pkt_all||0} <span class="muted">(uniq ${s.pkt_uniq||0})</span></dd>
+          <dt>outgoing</dt><dd>${s.pkt_outgoing||0} pkts · ${fmtRate(s.outgoing_bytes||0, s.interval_ms||0)}</dd>
+          <dt>lost</dt><dd>${s.pkt_lost||0} (${lossPct.toFixed(2)}%)</dd>
+          <dt>fec rec</dt><dd>${s.pkt_fec_recovered||0}</dd>
+          <dt>dec_err</dt><dd>${s.pkt_dec_err||0}</dd>
+          <dt>antennas</dt><dd>${s.ant_count||0}${s.rssi_best!==undefined?` · best rssi ${s.rssi_best} dBm`:''}</dd>
+        </dl>
+      </div>`;
+    } else {
+      const r=t.radio||{}, f=t.fec||{};
+      const radioOK = r.have;
+      const fecOK   = f.have;
+      detail = `<dt>udp_in</dt><dd>${t.udp_in_port}</dd>
+         <dt>control</dt><dd>${t.control_port||'<span class="muted">-</span>'}</dd>
+         <dt>fec</dt><dd>k=${fmtUnset(f.k,'?')} n=${fmtUnset(f.n,'?')} timeout=${fmtUnset(f.timeout_ms,'?')}ms ${fecOK?'<span class="muted">live</span>':'<span class="muted">cfg</span>'}</dd>
+         <dt>radio</dt><dd>bw=${r.bw||0} mcs=${fmtUnset(r.mcs)} stbc=${fmtUnset(r.stbc,'0')} ldpc=${fmtUnset(r.ldpc,'0')} ${radioOK?'<span class="muted">live</span>':'<span class="muted">cfg</span>'}</dd>
+         <dt>radio2</dt><dd>sgi=${fmtUnset(r.short_gi,'0')} vht=${fmtUnset(r.vht_mode,'0')}/${fmtUnset(r.vht_nss,'0')}</dd>`;
+      const s=t.stats||{};
+      const live = s.msg_count>0;
+      const stale = !live || (s.age_ms!==undefined && s.age_ms>3000);
+      const dot = !live ? 'bad' : (stale ? 'warn' : 'on');
+      const dotLbl = !live ? 'no datagrams' : (stale ? `stale ${Math.round((s.age_ms||0)/1000)}s` : `${s.interval_ms||0} ms`);
+      const dropPct = (s.pkts_in>0) ? ((s.pkts_drop||0)*100/s.pkts_in) : 0;
+      statsBlock = `<div class="stats-panel ${live?'':'stats-empty'}">
+        <div class="stats-head">
+          <span class="tbar-dot ${dot}"></span>
+          <span>uplink</span>
+          <span class="muted">${dotLbl}</span>
+        </div>
+        <dl class="tunnel-kv stats-grid">
+          <dt>in</dt><dd>${s.pkts_in||0} pkts · ${fmtRate(s.bytes_in||0, s.interval_ms||0)}</dd>
+          <dt>on-air</dt><dd>${s.pkts_out||0} pkts · ${fmtRate(s.bytes_out||0, s.interval_ms||0)}</dd>
+          <dt>drop</dt><dd>${s.pkts_drop||0} (${dropPct.toFixed(2)}%)${s.pkts_trunc?` · trunc ${s.pkts_trunc}`:''}</dd>
+          <dt>fec t/o</dt><dd>${s.fec_timeouts||0}</dd>
+        </dl>
+      </div>`;
+    }
+    return `<div class="tunnel">
+      <div class="tunnel-head">
+        <div class="tunnel-name">${tname}</div>
+        <span class="role-badge role-${trole}">${trole}</span>
+        <span class="state-badge state-${tstate}">${tstate}</span>
+      </div>
+      <div class="tunnel-body">
+        <dl class="tunnel-kv">
+          <dt>pid</dt><dd>${t.pid>0?t.pid:'<span class="muted">-</span>'}</dd>
+          <dt>restarts</dt><dd>${t.restarts||0}</dd>
+          <dt>link_id</dt><dd>${t.link_id} / radio_port ${t.radio_port}</dd>
+          <dt>ifaces</dt><dd>${ifs}</dd>
+          ${detail}
+          ${t.last_exit!==undefined?`<dt>last_exit</dt><dd>${esc(t.last_exit)}</dd>`:''}
+        </dl>
+        ${statsBlock}
+        <div class="tunnel-actions">
+          <button class="btn-mini btn-start" ${t.state==='running'?'disabled':''} onclick="tunnelAction('${jsAttr(t.name)}','start')">Start</button>
+          <button class="btn-mini btn-stop" ${t.state==='running'||t.state==='backoff'?'':'disabled'} onclick="tunnelAction('${jsAttr(t.name)}','stop')">Stop</button>
+          <button class="btn-mini btn-restart" onclick="tunnelAction('${jsAttr(t.name)}','restart')">Restart</button>
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function populateCtrlTunnels(ts){
+  const sel=$('#ctrl-tunnel');
+  const cur=sel.value;
+  const txs=(ts||[]).filter(t=>t.role==='tx' && t.control_port>0);
+  sel.innerHTML=txs.length
+    ? txs.map(t=>`<option value="${esc(t.name)}">${esc(t.name)} (control_port ${esc(t.control_port)})</option>`).join('')
+    : `<option value="">no tx tunnels with control_port</option>`;
+  if(txs.find(t=>t.name===cur)) sel.value=cur;
+}
+
+async function tunnelAction(name, action){
+  try{
+    const r=await fetch(`/api/v1/tunnels/${name}/${action}`);
+    const j=await r.json();
+    if(j.ok===false) throw new Error(j.error||'failed');
+    toast(`${name}: ${action} ok`, 'ok');
+    setTimeout(refresh, 200);
+  }catch(e){ toast(`${name}: ${action} failed: ${e.message||e}`, 'err'); }
+}
+
+function setReply(id, j, ok){
+  const el=$(id);
+  el.className='reply '+(ok?'ok':'err');
+  el.textContent=JSON.stringify(j,null,2);
+}
+
+async function ctrlReq(qs, replyId){
+  const tunnel=$('#ctrl-tunnel').value;
+  if(!tunnel){ toast('no tx tunnel selected','err'); return; }
+  try{
+    const r=await fetch(`/api/v1/tunnels/${tunnel}/control?${qs}`);
+    const j=await r.json();
+    setReply(replyId, j, j.ok);
+    if(!j.ok) toast(`control failed: ${j.error||'rc='+j.rc}`,'err');
+  }catch(e){ setReply(replyId, {ok:false,error:String(e)}, false); }
+}
+
+function ctrlGetFec(){ ctrlReq('cmd=get_fec','#reply-fec'); }
+function ctrlSetFec(){
+  const k=$('#fec-k').value, n=$('#fec-n').value, to=$('#fec-to').value;
+  let qs=`cmd=set_fec&k=${k}&n=${n}`;
+  if(to!=='') qs+=`&fec_timeout_ms=${to}`;
+  ctrlReq(qs,'#reply-fec');
+}
+function ctrlGetRadio(){ ctrlReq('cmd=get_radio','#reply-radio'); }
+function ctrlSetRadio(){
+  const qs=`cmd=set_radio&stbc=${$('#r-stbc').value}&ldpc=${$('#r-ldpc').value}&short_gi=${$('#r-sgi').value}&bandwidth=${$('#r-bw').value}&mcs_index=${$('#r-mcs').value}&vht_mode=${$('#r-vhtm').value}&vht_nss=${$('#r-vhtn').value}`;
+  ctrlReq(qs,'#reply-radio');
+}
+
+async function cmdFire(){
+  const key=$('#cmd-key').value;
+  const val=$('#cmd-value').value;
+  let qs=`key=${encodeURIComponent(key)}`;
+  if(val!=='' && key!=='force_idr') qs+=`&value=${encodeURIComponent(val)}`;
+  try{
+    const r=await fetch(`/api/v1/cmd?${qs}`);
+    const j=await r.json();
+    setReply('#reply-cmd', j, j.ok);
+    if(!j.ok) toast(`cmd failed: ${j.error||'?'}`,'err');
+  }catch(e){ setReply('#reply-cmd', {ok:false,error:String(e)}, false); }
+}
+
+async function cmdQuick(key, value){
+  let qs=`key=${encodeURIComponent(key)}`;
+  if(value!==undefined) qs+=`&value=${value}`;
+  try{
+    const r=await fetch(`/api/v1/cmd?${qs}`);
+    const j=await r.json();
+    setReply('#reply-cmd', j, j.ok);
+    toast(`${key}${value!==undefined?'='+value:''}: ${j.ok?'sent':j.error}`, j.ok?'ok':'err');
+  }catch(e){ toast(`cmd failed: ${e.message||e}`,'err'); }
+}
+
+function manualRefresh(){ refresh(); }
+
+async function systemReinit(){
+  if(!confirm('Reinit will:\n  • stop every tunnel\n  • run system.down then system.up\n  • respawn autostart tunnels\n\nVideo stream will drop for ~6–8 s. Proceed?')) return;
+  toast('reinit: tearing down…', 'warn');
+  try{
+    const r=await fetch('/api/v1/system/reinit');
+    const j=await r.json();
+    if(j.ok===false) throw new Error(j.error||'reinit failed');
+    toast(`reinit ok — ${j.tunnels_spawned||0} tunnel(s) respawned`, 'ok');
+  }catch(e){
+    toast('reinit failed: '+e.message, 'err');
+  }
+  setTimeout(refresh, 800);
+}
+
+$$('.tab').forEach(t=>{
+  t.addEventListener('click', ()=>{
+    $$('.tab').forEach(x=>x.classList.remove('active'));
+    $$('.tab-content').forEach(x=>x.classList.remove('active'));
+    t.classList.add('active');
+    document.getElementById('tab-'+t.dataset.tab).classList.add('active');
+  });
+});
+
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>
