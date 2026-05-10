@@ -10,16 +10,22 @@
   "system": {
     "up": [
       "nmcli device set wlx40a5ef2f229b managed no",
+      "ip link set wlx40a5ef2f229b down",
       "iw dev wlx40a5ef2f229b set monitor otherbss",
-      "sleep 0.2",
+      "sleep 0.5",
       "ip link set wlx40a5ef2f229b up",
+      "sleep 0.3",
       "iw dev wlx40a5ef2f229b set channel 161",
+      "iw dev wlx40a5ef2f229b set txpower fixed 2000",
 
       "nmcli device set wlx40a5ef2f2308 managed no",
+      "ip link set wlx40a5ef2f2308 down",
       "iw dev wlx40a5ef2f2308 set monitor otherbss",
-      "sleep 0.2",
+      "sleep 0.5",
       "ip link set wlx40a5ef2f2308 up",
-      "iw dev wlx40a5ef2f2308 set channel 161"
+      "sleep 0.3",
+      "iw dev wlx40a5ef2f2308 set channel 161",
+      "iw dev wlx40a5ef2f2308 set txpower fixed 2000"
     ],
     "down": [
       "ip link set wlx40a5ef2f229b down",

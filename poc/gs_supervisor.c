@@ -407,9 +407,24 @@ typedef struct {
 	int                 stats_fwd_active;
 	char                stats_local_arg[GS_ARG_MAX]; /* "127.0.0.1:port" passed to -Y */
 
-	/* parsed rx_ant snapshot (rx tunnels only) */
+	/* parsed rx_ant / tx_stats snapshot
+	 *
+	 * rx_ant fields (rx role):     st_pkt_*, st_ant_count, st_rssi_best
+	 * tx_stats fields (tx role):   st_tx_pkts_in/out, st_tx_bytes_*,
+	 *                              st_tx_drop, st_tx_trunc, st_tx_fec_timeouts
+	 * shared fields:               st_first_us, st_last_us, st_interval_ms,
+	 *                              st_msg_count
+	 *
+	 * tx_stats also carries fec.k/fec.n/mcs/bw — those land in the
+	 * radio_cache / fec_cache fields directly so the WebUI's TX panel
+	 * doesn't need a separate get_radio / get_fec round-trip on every
+	 * change. */
 	uint64_t    st_first_us;
 	uint64_t    st_last_us;
+	uint32_t    st_interval_ms;
+	uint32_t    st_msg_count;
+
+	/* rx_ant decoder counters */
 	uint32_t    st_pkt_all;
 	uint32_t    st_pkt_lost;
 	uint32_t    st_pkt_fec;
@@ -417,10 +432,17 @@ typedef struct {
 	uint32_t    st_pkt_dec_err;
 	uint32_t    st_pkt_bytes;
 	uint32_t    st_pkt_uniq;
-	uint32_t    st_interval_ms;
-	uint32_t    st_msg_count;
 	int         st_ant_count;
 	int         st_rssi_best;          /* highest avg over antennas */
+
+	/* tx_stats encoder counters */
+	uint32_t    st_tx_pkts_in;
+	uint32_t    st_tx_pkts_out;
+	uint32_t    st_tx_bytes_in;
+	uint32_t    st_tx_bytes_out;
+	uint32_t    st_tx_drop;
+	uint32_t    st_tx_trunc;
+	uint32_t    st_tx_fec_timeouts;
 
 	/* tx-only runtime cache (echoes wfb_tx live state via wfb_cmd) */
 	int         short_gi;              /* -1 = unset */
@@ -782,6 +804,9 @@ static int build_argv_tx(const Tunnel *t, const char *key_file, ArgvBuilder *ab)
 	if (t->ldpc >= 0) {
 		if (ab_push(ab, "-L") < 0 || ab_push(ab, "%d", t->ldpc) < 0) return -1;
 	}
+	if (t->stats_local_arg[0]) {
+		if (ab_push(ab, "-Y") < 0 || ab_push(ab, "%s", t->stats_local_arg) < 0) return -1;
+	}
 	for (int i = 0; i < t->extra_arg_count; i++)
 		if (ab_push(ab, "%s", t->extra_args[i]) < 0) return -1;
 	for (int i = 0; i < t->iface_count; i++)
@@ -802,9 +827,11 @@ static int  wfb_cmd_refresh_fec(Tunnel *t);
 
 static int tunnel_spawn(Tunnel *t, const char *key_file)
 {
-	/* Lazy-open the rx stats listener — once per tunnel lifetime, port stays
-	 * stable across respawns so the argv stays cacheable. */
-	if (!strcmp(t->role, "rx") && t->stats_local_fd < 0) {
+	/* Lazy-open the per-tunnel stats listener.  rx tunnels emit rx_ant,
+	 * tx tunnels emit tx_stats — same -Y wire format, parsed by the same
+	 * stats_drain().  Port stays stable across respawns so the argv is
+	 * cacheable. */
+	if (t->stats_local_fd < 0) {
 		(void)stats_listener_open(t);
 	}
 
@@ -864,15 +891,21 @@ static int tunnel_spawn(Tunnel *t, const char *key_file)
 	if (!strcmp(t->role, "tx") && t->control_port > 0)
 		t->tx_init_query_after_us = t->started_us + 500000ull;
 
-	/* Reset stats counters — wfb_rx restarts its own monotonic counters
-	 * on respawn, so old values would lie. */
+	/* Reset stats counters — wfb_rx/wfb_tx restart their own monotonic
+	 * counters on respawn, so old values would lie. */
+	t->st_msg_count = 0;
+	t->st_interval_ms = 0;
+	t->st_first_us = t->st_last_us = 0;
 	if (!strcmp(t->role, "rx")) {
 		t->st_pkt_all = t->st_pkt_lost = t->st_pkt_fec = 0;
 		t->st_pkt_outgoing = t->st_pkt_dec_err = t->st_pkt_bytes = 0;
-		t->st_pkt_uniq = t->st_interval_ms = t->st_msg_count = 0;
+		t->st_pkt_uniq = 0;
 		t->st_ant_count = 0;
 		t->st_rssi_best = INT_MIN;
-		t->st_first_us = t->st_last_us = 0;
+	} else {
+		t->st_tx_pkts_in = t->st_tx_pkts_out = 0;
+		t->st_tx_bytes_in = t->st_tx_bytes_out = 0;
+		t->st_tx_drop = t->st_tx_trunc = t->st_tx_fec_timeouts = 0;
 	}
 
 	/* Promote to RUNNING after a short settle window in supervisor_tick;
@@ -1208,61 +1241,105 @@ static void stats_drain(Tunnel *t)
 			             sizeof(t->stats_fwd_addr));
 		}
 
-		/* Filter on type=rx_ant (the only thing wfb_rx -Y emits, but the
-		 * fallback is harmless). */
-		if (!strstr(buf, "\"type\":\"rx_ant\"")) continue;
-
-		/* "pkt":{...} block */
-		const char *pkt = NULL;
-		size_t pkl = 0;
-		if (json_slice_object(buf, (size_t)got, "pkt", &pkt, &pkl) == 0) {
-			uint32_t u;
-			if (json_pick_u32(pkt, pkl, "all",            &u) == 0) t->st_pkt_all      = u;
-			if (json_pick_u32(pkt, pkl, "lost",           &u) == 0) t->st_pkt_lost     = u;
-			if (json_pick_u32(pkt, pkl, "fec_recovered",  &u) == 0) t->st_pkt_fec      = u;
-			if (json_pick_u32(pkt, pkl, "outgoing",       &u) == 0) t->st_pkt_outgoing = u;
-			if (json_pick_u32(pkt, pkl, "dec_err",        &u) == 0) t->st_pkt_dec_err  = u;
-			if (json_pick_u32(pkt, pkl, "outgoing_bytes", &u) == 0) t->st_pkt_bytes    = u;
-			if (json_pick_u32(pkt, pkl, "uniq",           &u) == 0) t->st_pkt_uniq     = u;
-		}
 		uint32_t iv;
 		if (json_pick_u32(buf, (size_t)got, "interval_ms", &iv) == 0)
 			t->st_interval_ms = iv;
 
-		/* Walk antenna list for best avg rssi.  rssi.avg is signed. */
-		const char *ant = NULL;
-		size_t al = 0;
-		int ant_count = 0;
-		int best_rssi = INT_MIN;
-		if (json_slice_object(buf, (size_t)got, "ant", &ant, &al) == 0 && al >= 2) {
-			/* Each antenna is a {} object inside the array. */
-			int depth = 0;
-			size_t obj_start = 0;
-			for (size_t i = 0; i < al; i++) {
-				char ch = ant[i];
-				if (ch == '{') {
-					if (depth == 0) obj_start = i;
-					depth++;
-				} else if (ch == '}') {
-					depth--;
-					if (depth == 0) {
-						const char *o = ant + obj_start;
-						size_t ol = (i - obj_start) + 1;
-						const char *rblock;
-						size_t rbl;
-						if (json_slice_object(o, ol, "rssi", &rblock, &rbl) == 0) {
-							int32_t avg;
-							if (json_pick_i32(rblock, rbl, "avg", &avg) == 0) {
-								if (avg > best_rssi) best_rssi = avg;
+		/* Dispatch on JSON type.  wfb_rx emits rx_ant; wfb_tx emits
+		 * tx_stats.  We accept either on the same socket so a single
+		 * supervisor port works for both tunnel roles. */
+		bool is_rx_ant   = strstr(buf, "\"type\":\"rx_ant\"") != NULL;
+		bool is_tx_stats = strstr(buf, "\"type\":\"tx_stats\"") != NULL;
+		if (!is_rx_ant && !is_tx_stats) continue;
+
+		if (is_rx_ant) {
+			const char *pkt = NULL;
+			size_t pkl = 0;
+			if (json_slice_object(buf, (size_t)got, "pkt", &pkt, &pkl) == 0) {
+				uint32_t u;
+				if (json_pick_u32(pkt, pkl, "all",            &u) == 0) t->st_pkt_all      = u;
+				if (json_pick_u32(pkt, pkl, "lost",           &u) == 0) t->st_pkt_lost     = u;
+				if (json_pick_u32(pkt, pkl, "fec_recovered",  &u) == 0) t->st_pkt_fec      = u;
+				if (json_pick_u32(pkt, pkl, "outgoing",       &u) == 0) t->st_pkt_outgoing = u;
+				if (json_pick_u32(pkt, pkl, "dec_err",        &u) == 0) t->st_pkt_dec_err  = u;
+				if (json_pick_u32(pkt, pkl, "outgoing_bytes", &u) == 0) t->st_pkt_bytes    = u;
+				if (json_pick_u32(pkt, pkl, "uniq",           &u) == 0) t->st_pkt_uniq     = u;
+			}
+
+			/* Walk antenna list for best avg rssi.  rssi.avg is signed. */
+			const char *ant = NULL;
+			size_t al = 0;
+			int ant_count = 0;
+			int best_rssi = INT_MIN;
+			if (json_slice_object(buf, (size_t)got, "ant", &ant, &al) == 0 && al >= 2) {
+				int depth = 0;
+				size_t obj_start = 0;
+				for (size_t i = 0; i < al; i++) {
+					char ch = ant[i];
+					if (ch == '{') {
+						if (depth == 0) obj_start = i;
+						depth++;
+					} else if (ch == '}') {
+						depth--;
+						if (depth == 0) {
+							const char *o = ant + obj_start;
+							size_t ol = (i - obj_start) + 1;
+							const char *rblock;
+							size_t rbl;
+							if (json_slice_object(o, ol, "rssi", &rblock, &rbl) == 0) {
+								int32_t avg;
+								if (json_pick_i32(rblock, rbl, "avg", &avg) == 0) {
+									if (avg > best_rssi) best_rssi = avg;
+								}
 							}
+							ant_count++;
 						}
-						ant_count++;
 					}
 				}
 			}
+			t->st_ant_count = ant_count;
+			if (best_rssi != INT_MIN) t->st_rssi_best = best_rssi;
 		}
-		t->st_ant_count = ant_count;
-		if (best_rssi != INT_MIN) t->st_rssi_best = best_rssi;
+
+		if (is_tx_stats) {
+			const char *txb = NULL;
+			size_t tbl = 0;
+			if (json_slice_object(buf, (size_t)got, "tx", &txb, &tbl) == 0) {
+				uint32_t u;
+				int32_t  s;
+				if (json_pick_u32(txb, tbl, "pkts_in",      &u) == 0) t->st_tx_pkts_in     = u;
+				if (json_pick_u32(txb, tbl, "pkts_out",     &u) == 0) t->st_tx_pkts_out    = u;
+				if (json_pick_u32(txb, tbl, "bytes_in",     &u) == 0) t->st_tx_bytes_in    = u;
+				if (json_pick_u32(txb, tbl, "bytes_out",    &u) == 0) t->st_tx_bytes_out   = u;
+				if (json_pick_u32(txb, tbl, "pkts_drop",    &u) == 0) t->st_tx_drop        = u;
+				if (json_pick_u32(txb, tbl, "pkts_trunc",   &u) == 0) t->st_tx_trunc       = u;
+				if (json_pick_u32(txb, tbl, "fec_timeouts", &u) == 0) t->st_tx_fec_timeouts = u;
+				if (json_pick_i32(txb, tbl, "fec_k",        &s) == 0) {
+					t->fec_k = s;
+					t->fec_cache_have = 1;
+				}
+				if (json_pick_i32(txb, tbl, "fec_n",        &s) == 0) {
+					t->fec_n = s;
+					t->fec_cache_have = 1;
+				}
+			}
+			/* radio block — refresh the live radio cache so the WebUI
+			 * gets continuous updates without a wfb_cmd round-trip. */
+			const char *rb = NULL;
+			size_t rl = 0;
+			if (json_slice_object(buf, (size_t)got, "radio", &rb, &rl) == 0) {
+				int32_t s;
+				if (json_pick_i32(rb, rl, "mcs",      &s) == 0) t->mcs_index     = s;
+				if (json_pick_i32(rb, rl, "bw",       &s) == 0) t->bandwidth_mhz = s;
+				if (json_pick_i32(rb, rl, "short_gi", &s) == 0) t->short_gi      = s;
+				if (json_pick_i32(rb, rl, "stbc",     &s) == 0) t->stbc          = s;
+				if (json_pick_i32(rb, rl, "ldpc",     &s) == 0) t->ldpc          = s;
+				if (json_pick_i32(rb, rl, "vht_mode", &s) == 0) t->vht_mode      = s;
+				if (json_pick_i32(rb, rl, "vht_nss",  &s) == 0) t->vht_nss       = s;
+				t->radio_cache_have = 1;
+				t->radio_cache_us   = now_us();
+			}
+		}
 
 		uint64_t now = now_us();
 		if (t->st_msg_count == 0) t->st_first_us = now;
@@ -1820,25 +1897,34 @@ static int json_emit_tunnel(char *buf, size_t cap, const Tunnel *t, bool full)
 		}
 		APP(",\"autostart\":%s", t->autostart ? "true" : "false");
 	}
-	/* Always include stats for rx tunnels — even if empty, the WebUI
+	/* Always include stats for both roles — even if empty, the WebUI
 	 * uses the presence of `msg_count` to decide whether to render the
 	 * stats panel.  age_ms tells the UI how stale the snapshot is. */
-	if (!strcmp(t->role, "rx")) {
+	{
 		uint64_t age_ms = 0;
 		if (t->st_last_us) {
 			uint64_t now_u = now_us();
 			age_ms = (now_u > t->st_last_us) ? (now_u - t->st_last_us) / 1000 : 0;
 		}
 		APP(",\"stats\":{"
-		    "\"msg_count\":%u,\"interval_ms\":%u,"
-		    "\"pkt_all\":%u,\"pkt_lost\":%u,\"pkt_fec_recovered\":%u,"
-		    "\"pkt_outgoing\":%u,\"pkt_dec_err\":%u,\"pkt_uniq\":%u,"
-		    "\"outgoing_bytes\":%u,\"ant_count\":%d",
-		    t->st_msg_count, t->st_interval_ms,
-		    t->st_pkt_all, t->st_pkt_lost, t->st_pkt_fec,
-		    t->st_pkt_outgoing, t->st_pkt_dec_err, t->st_pkt_uniq,
-		    t->st_pkt_bytes, t->st_ant_count);
-		if (t->st_rssi_best != INT_MIN) APP(",\"rssi_best\":%d", t->st_rssi_best);
+		    "\"msg_count\":%u,\"interval_ms\":%u",
+		    t->st_msg_count, t->st_interval_ms);
+		if (!strcmp(t->role, "rx")) {
+			APP(",\"pkt_all\":%u,\"pkt_lost\":%u,\"pkt_fec_recovered\":%u,"
+			    "\"pkt_outgoing\":%u,\"pkt_dec_err\":%u,\"pkt_uniq\":%u,"
+			    "\"outgoing_bytes\":%u,\"ant_count\":%d",
+			    t->st_pkt_all, t->st_pkt_lost, t->st_pkt_fec,
+			    t->st_pkt_outgoing, t->st_pkt_dec_err, t->st_pkt_uniq,
+			    t->st_pkt_bytes, t->st_ant_count);
+			if (t->st_rssi_best != INT_MIN) APP(",\"rssi_best\":%d", t->st_rssi_best);
+		} else {
+			APP(",\"pkts_in\":%u,\"pkts_out\":%u,"
+			    "\"bytes_in\":%u,\"bytes_out\":%u,"
+			    "\"pkts_drop\":%u,\"pkts_trunc\":%u,\"fec_timeouts\":%u",
+			    t->st_tx_pkts_in, t->st_tx_pkts_out,
+			    t->st_tx_bytes_in, t->st_tx_bytes_out,
+			    t->st_tx_drop, t->st_tx_trunc, t->st_tx_fec_timeouts);
+		}
 		APP(",\"age_ms\":%llu", (unsigned long long)age_ms);
 		if (t->stats_local_port)
 			APP(",\"listen_port\":%u", (unsigned)t->stats_local_port);
@@ -1939,6 +2025,66 @@ static void api_handle(ApiClient *cli, Config *c, uint64_t startup_us)
 			p += w;
 		}
 		p += snprintf(body + p, sizeof(body) - p, "]");
+		api_send(cli->fd, 200, "application/json", body, p);
+		return;
+	}
+	if (!strcmp(path, "/api/v1/system/reinit")) {
+		/* Last-resort recovery: stop every tunnel, run system.down, then
+		 * system.up + wait_iface_state, then respawn autostart tunnels.
+		 * This unsticks adapters that are stuck in a bad post-monitor
+		 * state (txpower=-100, NO-CARRIER while in monitor mode, etc.) —
+		 * the symptoms we saw when WCMD packets stopped getting on-air. */
+		LOG_WARN("REST /system/reinit: tearing down all tunnels");
+		for (int i = 0; i < c->tunnel_count; i++) {
+			Tunnel *t = &c->tunnels[i];
+			if (t->pid > 0) {
+				t->autostart_on_exit = false;
+				if (kill(t->pid, SIGTERM) == 0)
+					t->stop_deadline_ms = now_ms() + GS_STOP_GRACE_MS;
+			}
+		}
+		uint64_t deadline = now_ms() + GS_STOP_GRACE_MS + 500;
+		while (now_ms() < deadline) {
+			bool any = false;
+			for (int i = 0; i < c->tunnel_count; i++)
+				if (c->tunnels[i].pid > 0) any = true;
+			if (!any) break;
+			supervisor_reap(c);
+			struct timespec ts = { .tv_sec = 0, .tv_nsec = 50 * 1000 * 1000 };
+			nanosleep(&ts, NULL);
+		}
+		for (int i = 0; i < c->tunnel_count; i++) {
+			if (c->tunnels[i].pid > 0) {
+				kill(c->tunnels[i].pid, SIGKILL);
+				waitpid(c->tunnels[i].pid, NULL, 0);
+				c->tunnels[i].pid = -1;
+			}
+		}
+		/* Stats listeners stay open across reinit — wfb_rx/wfb_tx will
+		 * be respawned with the same -Y target. */
+		LOG_INFO("REST /system/reinit: running system.down");
+		run_system_block("system.down", c->system_down, c->system_down_count);
+		LOG_INFO("REST /system/reinit: running system.up");
+		run_system_block("system.up",   c->system_up,   c->system_up_count);
+		int wait_rc = wait_iface_state(c, 5000, 100);
+		if (wait_rc != 0) {
+			api_send(cli->fd, 503, "application/json",
+			         "{\"ok\":false,\"error\":\"iface readiness timeout — check supervisor log\"}", -1);
+			return;
+		}
+		int spawned = 0;
+		for (int i = 0; i < c->tunnel_count; i++) {
+			Tunnel *t = &c->tunnels[i];
+			if (t->autostart) {
+				t->backoff_idx = 0;
+				t->next_start_ms = 0;
+				if (tunnel_spawn(t, c->key_file) == 0) spawned++;
+			}
+		}
+		char body[160];
+		int p = snprintf(body, sizeof(body),
+		                 "{\"ok\":true,\"reinit\":true,\"tunnels_spawned\":%d}",
+		                 spawned);
 		api_send(cli->fd, 200, "application/json", body, p);
 		return;
 	}

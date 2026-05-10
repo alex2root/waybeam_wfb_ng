@@ -138,6 +138,7 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:u
   <div class="tbar-item">tunnels <b id="tbar-tunnels">-</b></div>
   <div class="tbar-item"><div class="tbar-dot off" id="tbar-conn"></div><span id="tbar-conn-label">connecting</span></div>
   <div class="tbar-right">
+    <button class="tbar-btn" onclick="systemReinit()" title="Tear down all tunnels, run system.down + system.up, respawn — last-resort recovery for adapters stuck in a bad state (e.g. txpower=-100 dBm after monitor mode flip).">Reinit</button>
     <button class="tbar-btn" onclick="manualRefresh()">Refresh</button>
   </div>
 </div>
@@ -389,6 +390,25 @@ function renderTunnels(ts){
          <dt>fec</dt><dd>k=${fmtUnset(f.k,'?')} n=${fmtUnset(f.n,'?')} timeout=${fmtUnset(f.timeout_ms,'?')}ms ${fecOK?'<span class="muted">live</span>':'<span class="muted">cfg</span>'}</dd>
          <dt>radio</dt><dd>bw=${r.bw||0} mcs=${fmtUnset(r.mcs)} stbc=${fmtUnset(r.stbc,'0')} ldpc=${fmtUnset(r.ldpc,'0')} ${radioOK?'<span class="muted">live</span>':'<span class="muted">cfg</span>'}</dd>
          <dt>radio2</dt><dd>sgi=${fmtUnset(r.short_gi,'0')} vht=${fmtUnset(r.vht_mode,'0')}/${fmtUnset(r.vht_nss,'0')}</dd>`;
+      const s=t.stats||{};
+      const live = s.msg_count>0;
+      const stale = !live || (s.age_ms!==undefined && s.age_ms>3000);
+      const dot = !live ? 'bad' : (stale ? 'warn' : 'on');
+      const dotLbl = !live ? 'no datagrams' : (stale ? `stale ${Math.round((s.age_ms||0)/1000)}s` : `${s.interval_ms||0} ms`);
+      const dropPct = (s.pkts_in>0) ? ((s.pkts_drop||0)*100/s.pkts_in) : 0;
+      statsBlock = `<div class="stats-panel ${live?'':'stats-empty'}">
+        <div class="stats-head">
+          <span class="tbar-dot ${dot}"></span>
+          <span>uplink</span>
+          <span class="muted">${dotLbl}</span>
+        </div>
+        <dl class="tunnel-kv stats-grid">
+          <dt>in</dt><dd>${s.pkts_in||0} pkts · ${fmtBytes(s.bytes_in||0)} · ${fmtRate(s.bytes_in||0, s.interval_ms||0)}</dd>
+          <dt>on-air</dt><dd>${s.pkts_out||0} pkts · ${fmtBytes(s.bytes_out||0)} · ${fmtRate(s.bytes_out||0, s.interval_ms||0)}</dd>
+          <dt>drop</dt><dd>${s.pkts_drop||0} (${dropPct.toFixed(2)}%)${s.pkts_trunc?` · trunc ${s.pkts_trunc}`:''}</dd>
+          <dt>fec t/o</dt><dd>${s.fec_timeouts||0}</dd>
+        </dl>
+      </div>`;
     }
     return `<div class="tunnel">
       <div class="tunnel-head">
@@ -491,6 +511,20 @@ async function cmdQuick(key, value){
 }
 
 function manualRefresh(){ refresh(); }
+
+async function systemReinit(){
+  if(!confirm('Reinit will:\n  • stop every tunnel\n  • run system.down then system.up\n  • respawn autostart tunnels\n\nVideo stream will drop for ~6–8 s. Proceed?')) return;
+  toast('reinit: tearing down…', 'warn');
+  try{
+    const r=await fetch('/api/v1/system/reinit');
+    const j=await r.json();
+    if(j.ok===false) throw new Error(j.error||'reinit failed');
+    toast(`reinit ok — ${j.tunnels_spawned||0} tunnel(s) respawned`, 'ok');
+  }catch(e){
+    toast('reinit failed: '+e.message, 'bad');
+  }
+  setTimeout(refresh, 800);
+}
 
 $$('.tab').forEach(t=>{
   t.addEventListener('click', ()=>{
