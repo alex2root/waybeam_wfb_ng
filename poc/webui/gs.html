@@ -268,6 +268,7 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:u
             <option value="wfb_ldpc">wfb_ldpc</option>
             <option value="wfb_stbc">wfb_stbc</option>
             <option value="wfb_short_gi">wfb_short_gi</option>
+            <option value="wfb_txpower">wfb_txpower</option>
           </optgroup>
           <optgroup label="vehicle adaptive switches">
             <option value="fec_enabled">fec_enabled</option>
@@ -328,6 +329,68 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:u
       <button class="btn-mini btn-start" onclick="cmdQuick('wfb_ldpc',1)">ldpc 1</button>
       <button class="btn-mini btn-stop" onclick="cmdQuick('wfb_short_gi',0)">sgi 0</button>
       <button class="btn-mini btn-start" onclick="cmdQuick('wfb_short_gi',1)">sgi 1</button>
+      <button class="btn-mini btn-start" onclick="cmdQuick('wfb_txpower',500)">txp 5 dBm</button>
+      <button class="btn-mini btn-start" onclick="cmdQuick('wfb_txpower',1500)">txp 15 dBm</button>
+      <button class="btn-mini btn-start" onclick="cmdQuick('wfb_txpower',2000)">txp 20 dBm</button>
+      <button class="btn-mini btn-start" onclick="cmdQuick('wfb_txpower',2500)">txp 25 dBm</button>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-header"><h3>GS adapter txpower</h3>
+      <span class="help">Per-iface <code>iw set txpower fixed &lt;mBm&gt;</code> on this host. 100 mBm = 1 dBm. Useful when an adapter dropped to txpower=-100 after a monitor-mode flip.</span></div>
+    <div class="section-body" id="gs-txpower-row" style="display:flex;gap:.5rem;flex-wrap:wrap">
+      <span class="muted">Loading ifaces…</span>
+    </div>
+    <div class="reply" id="reply-gs-txpower"></div>
+  </div>
+
+  <div class="section">
+    <div class="section-header"><h3>Synchronized channel hop (CSA)</h3>
+      <span class="help">Sends 5 <code>csa_commit</code> JSON frames to the vehicle over the uplink, then runs <code>iw set channel</code> locally at T_switch. Vehicle's csa_tick mirrors the same timing. Auto-revert if no rx traffic within t_revert_ms.</span></div>
+    <div class="section-body">
+      <div class="field">
+        <div class="field-label">ifaces <span class="help">GS-side adapter(s) to switch — pick one or more (Ctrl+click for multi)</span></div>
+        <select id="csa-iface" multiple size="3" style="width:100%"></select>
+      </div>
+      <div class="field">
+        <div class="field-label">target chan</div>
+        <input type="number" id="csa-chan" value="161" min="1" max="200">
+      </div>
+      <div class="field">
+        <div class="field-label">target ht</div>
+        <select id="csa-ht">
+          <option value="HT20">HT20</option>
+          <option value="HT40+">HT40+</option>
+          <option value="HT40-">HT40-</option>
+        </select>
+      </div>
+      <div class="field">
+        <div class="field-label">prev chan / ht <span class="help">used for auto-revert</span></div>
+        <div style="display:flex;gap:.4rem">
+          <input type="number" id="csa-prev-chan" value="161" min="1" max="200" style="width:6rem">
+          <select id="csa-prev-ht">
+            <option value="HT20">HT20</option>
+            <option value="HT40+">HT40+</option>
+            <option value="HT40-">HT40-</option>
+          </select>
+        </div>
+      </div>
+      <div class="field">
+        <div class="field-label">lead_ms</div>
+        <input type="number" id="csa-lead" value="500" min="100" max="5000">
+      </div>
+      <div class="field">
+        <div class="field-label">t_revert_ms</div>
+        <input type="number" id="csa-revert" value="3000" min="500" max="30000">
+      </div>
+      <div class="field" style="grid-template-columns:auto 1fr auto;gap:.5rem">
+        <label style="display:flex;align-items:center;gap:.3rem"><input type="checkbox" id="csa-no-revert"> no_revert</label>
+        <span></span>
+        <button class="btn btn-fire" onclick="csaFire()">Hop</button>
+      </div>
+      <div class="reply" id="reply-csa"></div>
+      <div class="muted" id="csa-state" style="margin-top:.4rem">phase: idle</div>
     </div>
   </div>
 </div>
@@ -368,9 +431,116 @@ async function refresh(){
     lastTunnels=tj;
     renderTunnels(tj);
     populateCtrlTunnels(tj);
+    renderGsTxpowerRow(tj);
+    populateCsaIfaceSelect(tj);
+    refreshCsaState();
   }catch(e){
     setConn(false);
   }
+}
+
+function renderGsTxpowerRow(ts){
+  const row=$('#gs-txpower-row');
+  if(!row) return;
+  const seen=new Set();
+  const ifaces=[];
+  (ts||[]).forEach(t=>(t.ifaces||[]).forEach(i=>{
+    if(!seen.has(i)){ seen.add(i); ifaces.push(i); }
+  }));
+  if(!ifaces.length){
+    row.innerHTML='<span class="muted">no ifaces configured</span>';
+    return;
+  }
+  // For each iface, a label + four mBm presets.
+  const presets=[500,1500,2000,2500];
+  let h='';
+  ifaces.forEach(i=>{
+    h+=`<div style="display:flex;align-items:center;gap:.4rem">`;
+    h+=`<code>${i}</code>`;
+    presets.forEach(m=>{
+      const dbm=(m/100).toFixed(0);
+      h+=`<button class="btn-mini btn-start" onclick="gsTxpower('${i}',${m})">${dbm} dBm</button>`;
+    });
+    h+=`</div>`;
+  });
+  row.innerHTML=h;
+}
+
+async function gsTxpower(iface, mbm){
+  try{
+    const r=await fetch(`/api/v1/system/txpower?iface=${encodeURIComponent(iface)}&mbm=${mbm}`);
+    const j=await r.json();
+    setReply('#reply-gs-txpower', j, j.ok);
+    toast(`${iface} → ${(mbm/100).toFixed(0)} dBm: ${j.ok?'ok':'iw rc='+j.iw_rc}`, j.ok?'ok':'err');
+  }catch(e){ toast(`txpower failed: ${e.message||e}`,'err'); }
+}
+
+function populateCsaIfaceSelect(ts){
+  const sel=$('#csa-iface');
+  if(!sel) return;
+  const seen=new Set();
+  const ifaces=[];
+  (ts||[]).forEach(t=>(t.ifaces||[]).forEach(i=>{
+    if(!seen.has(i)){ seen.add(i); ifaces.push(i); }
+  }));
+  // Preserve current selection set if still present.
+  const cur=new Set(Array.from(sel.selectedOptions||[]).map(o=>o.value));
+  sel.innerHTML='';
+  ifaces.forEach(i=>{
+    const o=document.createElement('option');
+    o.value=i; o.textContent=i;
+    // First load: select all by default so the diversity case "just works".
+    if((cur.size===0 && sel.dataset.firstLoad!=='no') || cur.has(i)) o.selected=true;
+    sel.appendChild(o);
+  });
+  sel.dataset.firstLoad='no';
+}
+
+async function refreshCsaState(){
+  try{
+    const r=await fetch('/api/v1/csa');
+    const j=await r.json();
+    const phaseLabel=['idle','burst','armed','verify'][j.phase]||'?';
+    const el=$('#csa-state');
+    if(!el) return;
+    const ifs=(j.ifaces||[]).join(',');
+    if(j.phase===0){
+      el.textContent='phase: idle';
+    } else if(j.phase===1 || j.phase===2){
+      el.textContent=`phase: ${phaseLabel} sess=${j.sess} ifaces=[${ifs}] `+
+        `frames=${j.frames_sent}/${j.frames_total} `+
+        `T_switch in ${j.t_to_switch_ms.toFixed(0)} ms `+
+        `→ chan ${j.target_chan} ${j.target_ht}`;
+    } else {
+      el.textContent=`phase: ${phaseLabel} sess=${j.sess} ifaces=[${ifs}] `+
+        `T_revert in ${j.t_to_revert_ms.toFixed(0)} ms`;
+    }
+  }catch(e){}
+}
+
+async function csaFire(){
+  const sel=$('#csa-iface');
+  const ifaceList=Array.from(sel.selectedOptions).map(o=>o.value);
+  const chan=parseInt($('#csa-chan').value,10);
+  const ht=$('#csa-ht').value;
+  const prev_chan=parseInt($('#csa-prev-chan').value,10);
+  const prev_ht=$('#csa-prev-ht').value;
+  const lead_ms=parseInt($('#csa-lead').value,10);
+  const t_revert_ms=parseInt($('#csa-revert').value,10);
+  const no_revert=$('#csa-no-revert').checked?1:0;
+  if(!ifaceList.length){ toast('select at least one iface','err'); return; }
+  const ifaces=ifaceList.join(',');
+  const qs=`iface=${encodeURIComponent(ifaces)}&chan=${chan}&ht=${encodeURIComponent(ht)}`+
+           `&prev_chan=${prev_chan}&prev_ht=${encodeURIComponent(prev_ht)}`+
+           `&lead_ms=${lead_ms}&t_revert_ms=${t_revert_ms}&no_revert=${no_revert}`;
+  if(!confirm(`Hop ${ifaceList.length} iface(s) [${ifaces}] → chan ${chan} ${ht} (revert to ${prev_chan} ${prev_ht} in ${t_revert_ms} ms if no traffic)?\n\nVideo will drop briefly during the switch.`)) return;
+  try{
+    const r=await fetch(`/api/v1/system/csa?${qs}`);
+    const j=await r.json();
+    setReply('#reply-csa', j, j.ok);
+    toast(`csa ${j.ok?'armed':'rejected'}: ${j.error||'sess='+j.sess}`, j.ok?'ok':'err');
+    refreshCsaState();
+  }catch(e){ toast(`csa failed: ${e.message||e}`,'err'); }
 }
 
 function setConn(ok){

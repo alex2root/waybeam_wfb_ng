@@ -983,6 +983,131 @@ static void supervisor_reap(Config *c)
 	}
 }
 
+/* ---------- CSA orchestrator (channel switch announcement) ----------- *
+ *
+ * One-shot synchronized channel hop coordinated with vehicle's csa_feed
+ * state machine in poc/csa/csa.c. Wire format is documented in
+ * poc/csa/PROTOCOL.md (newline-terminated JSON `csa_commit` frames).
+ *
+ * Flow:
+ *   1. POST /api/v1/system/csa records sess++/T_switch and queues N=5
+ *      csa_commit frames at 20 ms cadence into the uplink wfb_tx UDP
+ *      input port (same hop that WCMDs use).
+ *   2. supervisor_tick drains the queue and, at T_switch, fork+execs
+ *      `iw dev <iface> set channel <chan> <ht>` on the GS-side iface.
+ *   3. On revert deadline T_switch+t_revert_ms: if no rx_ant pkts
+ *      arrived since T_switch on any rx tunnel, fork+exec a revert iw.
+ *      Mirrors vehicle csa_tick's verify→revert behavior.
+ *
+ * One CSA in flight at a time; a new POST while phase!=IDLE returns 409.
+ */
+
+typedef enum {
+	CSA_IDLE = 0,
+	CSA_BURST,    /* sending csa_commit frames */
+	CSA_ARMED,    /* burst done, waiting for T_switch */
+	CSA_VERIFY,   /* iw set ran, watching for traffic */
+} CsaPhase;
+
+#define GS_CSA_MAX_IFACES 4
+
+static struct {
+	CsaPhase phase;
+	uint32_t sess;
+	uint64_t t_switch_us;
+	uint64_t t_revert_us;
+	uint64_t next_frame_us;
+	int      frames_sent;
+	int      frames_total;
+	int      target_chan;
+	char     target_ht[8];
+	int      prev_chan;
+	char     prev_ht[8];
+	char     ifaces[GS_CSA_MAX_IFACES][IFNAMSIZ]; /* GS-side ifaces to switch (comma-sep input) */
+	int      iface_count;
+	uint64_t baseline_pkt_us;   /* time we snapshotted st_pkt_all */
+	uint32_t baseline_pkt_all;  /* pkt counter at T_switch (per first rx) */
+	int      baseline_rx_idx;
+	bool     no_revert;
+} g_csa = { .phase = CSA_IDLE, .sess = 0 };
+
+static uint32_t g_csa_seq_in_burst = 0;
+
+/* fork+exec `iw dev <iface> set channel <chan> <ht>`. */
+static int run_iw_set_channel(const char *iface, int chan, const char *ht)
+{
+	if (!iface || !iface[0]) return -1;
+	char cs[16];
+	snprintf(cs, sizeof(cs), "%d", chan);
+	pid_t pid = fork();
+	if (pid < 0) return -1;
+	if (pid == 0) {
+		execl("/usr/sbin/iw", "iw", "dev", iface, "set", "channel",
+		      cs, ht, (char*)NULL);
+		execlp("iw", "iw", "dev", iface, "set", "channel",
+		       cs, ht, (char*)NULL);
+		_exit(127);
+	}
+	int st;
+	waitpid(pid, &st, 0);
+	return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+}
+
+/* Send one csa_commit JSON frame to the uplink wfb_tx UDP input port.
+ * dt_to_switch_ms is filled in fresh at send time so all frames in the
+ * burst converge on the same absolute T_switch on the receiver. */
+static int csa_send_commit_frame(const Config *c)
+{
+	const Tunnel *up = NULL;
+	for (int i = 0; i < c->tunnel_count; i++) {
+		if (!strcmp(c->tunnels[i].name, c->venc_cmd_uplink) &&
+		    !strcmp(c->tunnels[i].role, "tx")) {
+			up = &c->tunnels[i];
+			break;
+		}
+	}
+	if (!up || up->udp_in_port <= 0) return -1;
+
+	uint64_t now = now_us();
+	int dt_ms = (g_csa.t_switch_us > now)
+	    ? (int)((g_csa.t_switch_us - now) / 1000ULL) : 0;
+	int t_revert_ms = (int)((g_csa.t_revert_us - g_csa.t_switch_us) / 1000ULL);
+
+	char buf[320];
+	int n = snprintf(buf, sizeof(buf),
+		"{\"type\":\"csa_commit\",\"ver\":1,\"sess\":%u,\"seq\":%u,"
+		"\"src\":\"ground\",\"target_chan\":%d,\"target_ht\":\"%s\","
+		"\"dt_to_switch_ms\":%d,\"t_revert_ms\":%d,"
+		"\"prev_chan\":%d,\"prev_ht\":\"%s\"}\n",
+		g_csa.sess, g_csa_seq_in_burst++,
+		g_csa.target_chan, g_csa.target_ht,
+		dt_ms, t_revert_ms,
+		g_csa.prev_chan, g_csa.prev_ht);
+	if (n < 0 || (size_t)n >= sizeof(buf)) return -1;
+
+	int s = socket(AF_INET, SOCK_DGRAM, 0);
+	if (s < 0) return errno;
+	struct sockaddr_in dst = {
+		.sin_family = AF_INET,
+		.sin_port   = htons((uint16_t)up->udp_in_port),
+	};
+	dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	ssize_t w = sendto(s, buf, (size_t)n, 0,
+	                   (struct sockaddr *)&dst, sizeof(dst));
+	int err = (w == (ssize_t)n) ? 0 : errno;
+	close(s);
+	return err;
+}
+
+/* Pick the first rx tunnel — used to track post-switch traffic for
+ * revert detection. Returns -1 if no rx tunnel exists. */
+static int csa_pick_rx_tunnel_idx(const Config *c)
+{
+	for (int i = 0; i < c->tunnel_count; i++)
+		if (!strcmp(c->tunnels[i].role, "rx")) return i;
+	return -1;
+}
+
 /* Periodic tick: handle SIGKILL escalation + backoff respawn, plus
  * deferred TX state queries (~500 ms after spawn so wfb_tx has bound
  * its control socket). */
@@ -1019,6 +1144,68 @@ static void supervisor_tick(Config *c)
 			}
 			(void)wfb_cmd_refresh_fec(t);
 		}
+	}
+
+	/* CSA state machine: drive burst frames, fire local iw at T_switch,
+	 * watch for revert. */
+	if (g_csa.phase == CSA_BURST &&
+	    t_us >= g_csa.next_frame_us &&
+	    g_csa.frames_sent < g_csa.frames_total) {
+		int rc = csa_send_commit_frame(c);
+		if (rc != 0) {
+			LOG_WARN("csa: send frame %d/%d failed (rc=%d) — aborting",
+			         g_csa.frames_sent + 1, g_csa.frames_total, rc);
+			g_csa.phase = CSA_IDLE;
+		} else {
+			g_csa.frames_sent++;
+			g_csa.next_frame_us = t_us + 20000ULL; /* 20 ms cadence */
+			if (g_csa.frames_sent >= g_csa.frames_total) {
+				g_csa.phase = CSA_ARMED;
+				LOG_INFO("csa: burst complete (%d frames), armed for "
+				         "T_switch in %.0f ms",
+				         g_csa.frames_total,
+				         (double)(g_csa.t_switch_us - t_us) / 1000.0);
+			}
+		}
+	}
+
+	if (g_csa.phase == CSA_ARMED && t_us >= g_csa.t_switch_us) {
+		LOG_INFO("csa: T_switch — iw set channel %d %s on %d iface(s)",
+		         g_csa.target_chan, g_csa.target_ht, g_csa.iface_count);
+		/* Snapshot the rx pkt counter so VERIFY can decide whether
+		 * traffic resumed on the new channel. */
+		int idx = csa_pick_rx_tunnel_idx(c);
+		g_csa.baseline_rx_idx = idx;
+		g_csa.baseline_pkt_all = (idx >= 0) ? c->tunnels[idx].st_pkt_all : 0;
+		g_csa.baseline_pkt_us  = t_us;
+		for (int i = 0; i < g_csa.iface_count; i++) {
+			int rc = run_iw_set_channel(g_csa.ifaces[i],
+			    g_csa.target_chan, g_csa.target_ht);
+			if (rc != 0)
+				LOG_WARN("csa: iw on %s rc=%d", g_csa.ifaces[i], rc);
+		}
+		g_csa.phase = CSA_VERIFY;
+	}
+
+	if (g_csa.phase == CSA_VERIFY && t_us >= g_csa.t_revert_us) {
+		bool alive = false;
+		if (g_csa.baseline_rx_idx >= 0) {
+			uint32_t now_pkt = c->tunnels[g_csa.baseline_rx_idx].st_pkt_all;
+			alive = (now_pkt != g_csa.baseline_pkt_all);
+		}
+		if (alive || g_csa.no_revert) {
+			LOG_INFO("csa: VERIFY ok (rx_alive=%d no_revert=%d) — committed",
+			         (int)alive, (int)g_csa.no_revert);
+		} else {
+			LOG_WARN("csa: no rx traffic since T_switch — reverting "
+			         "%d iface(s) to channel %d %s",
+			         g_csa.iface_count, g_csa.prev_chan, g_csa.prev_ht);
+			for (int i = 0; i < g_csa.iface_count; i++) {
+				(void)run_iw_set_channel(g_csa.ifaces[i],
+				    g_csa.prev_chan, g_csa.prev_ht);
+			}
+		}
+		g_csa.phase = CSA_IDLE;
 	}
 }
 
@@ -1701,6 +1888,8 @@ static int qs_get_int(const char *qs, const char *key, int *out)
 /* Adaptive subsystem master switches on the vehicle's link_controller. */
 #define WCMD_KEY_FEC_ENABLED    12
 #define WCMD_KEY_MCS_ENABLED    13
+/* Vehicle WLAN adapter TX power (mBm; 100 = 1 dBm). */
+#define WCMD_KEY_WFB_TXPOWER    14
 
 #pragma pack(push, 1)
 typedef struct {
@@ -1735,6 +1924,7 @@ static int wcmd_key_from_str(const char *s, size_t n)
 	if (n == 12 && !strncmp(s, "wfb_short_gi", 12))  return WCMD_KEY_WFB_SHORT_GI;
 	if (n == 11 && !strncmp(s, "fec_enabled", 11))   return WCMD_KEY_FEC_ENABLED;
 	if (n == 11 && !strncmp(s, "mcs_enabled", 11))   return WCMD_KEY_MCS_ENABLED;
+	if (n == 11 && !strncmp(s, "wfb_txpower", 11))   return WCMD_KEY_WFB_TXPOWER;
 	return -1;
 }
 
@@ -1754,6 +1944,7 @@ static const char *wcmd_key_name(int key)
 	case WCMD_KEY_WFB_SHORT_GI:  return "wfb_short_gi";
 	case WCMD_KEY_FEC_ENABLED:   return "fec_enabled";
 	case WCMD_KEY_MCS_ENABLED:   return "mcs_enabled";
+	case WCMD_KEY_WFB_TXPOWER:   return "wfb_txpower";
 	}
 	return "?";
 }
@@ -2130,7 +2321,7 @@ static void api_handle(ApiClient *cli, Config *c, uint64_t startup_us)
 			         "key must be bitrate_kbps|fps|payload_bytes|force_idr|"
 			         "wfb_fec_k|wfb_fec_n|wfb_mcs|wfb_bandwidth|"
 			         "wfb_ldpc|wfb_stbc|wfb_short_gi|"
-			         "fec_enabled|mcs_enabled\n", -1);
+			         "fec_enabled|mcs_enabled|wfb_txpower\n", -1);
 			return;
 		}
 		int32_t value = 0;
@@ -2186,6 +2377,260 @@ static void api_handle(ApiClient *cli, Config *c, uint64_t startup_us)
 			             (unsigned)seq, wcmd_key_name(key), (int)value);
 		}
 		api_send(cli->fd, 200, "application/json", body, p);
+		return;
+	}
+	if (!strcmp(path, "/api/v1/system/csa")) {
+		/* Synchronized channel hop. Required: chan, ht, iface. Optional:
+		 * lead_ms (default 500), t_revert_ms (default 3000),
+		 * prev_chan/prev_ht (defaults: assume current channel from the
+		 * iface's last known state — operator override accepted),
+		 * no_revert (1 disables auto-revert; default 0).
+		 *
+		 * Schedule: now → BURST (5 frames @ 20 ms) → ARMED → at T_switch
+		 * fork iw set channel → VERIFY for t_revert_ms → revert if no
+		 * traffic.  Vehicle's csa_tick mirrors the same revert deadline. */
+		if (g_csa.phase != CSA_IDLE) {
+			char body[160];
+			int p = snprintf(body, sizeof(body),
+			    "{\"ok\":false,\"error\":\"csa already active\","
+			    "\"phase\":%d,\"sess\":%u}",
+			    (int)g_csa.phase, g_csa.sess);
+			api_send(cli->fd, 409, "application/json", body, p);
+			return;
+		}
+		size_t il, hl_ht;
+		const char *istr = qs_get(qstr, "iface", &il);
+		const char *htstr = qs_get(qstr, "ht", &hl_ht);
+		int chan = -1;
+		if (qs_get_int(qstr, "chan", &chan) != 0 || chan < 1 || chan > 200) {
+			api_send(cli->fd, 400, "text/plain",
+			    "missing/bad ?chan= (1..200)\n", -1);
+			return;
+		}
+		if (!istr || il == 0 ||
+		    !htstr || hl_ht == 0 || hl_ht >= 8) {
+			api_send(cli->fd, 400, "text/plain",
+			    "missing ?iface=name1,name2,…&ht=HT20|HT40+|HT40-\n", -1);
+			return;
+		}
+		/* Accept comma-separated iface list so a diversity-RX setup
+		 * (multiple GS adapters per video tunnel) can hop atomically. */
+		char ifaces[GS_CSA_MAX_IFACES][IFNAMSIZ];
+		int  iface_count = 0;
+		const char *p = istr, *end = istr + il;
+		while (p < end && iface_count < GS_CSA_MAX_IFACES) {
+			const char *q = p;
+			while (q < end && *q != ',') q++;
+			size_t len = (size_t)(q - p);
+			if (len == 0 || len >= IFNAMSIZ) {
+				api_send(cli->fd, 400, "text/plain",
+				    "bad iface in list\n", -1); return;
+			}
+			memcpy(ifaces[iface_count], p, len);
+			ifaces[iface_count][len] = 0;
+			iface_count++;
+			p = q + 1;
+		}
+		if (iface_count == 0) {
+			api_send(cli->fd, 400, "text/plain", "no iface\n", -1);
+			return;
+		}
+		for (int j = 0; j < iface_count; j++) {
+			bool known = false;
+			for (int i = 0; i < c->tunnel_count && !known; i++) {
+				for (int k = 0; k < c->tunnels[i].iface_count; k++) {
+					if (!strcmp(c->tunnels[i].ifaces[k], ifaces[j])) {
+						known = true; break;
+					}
+				}
+			}
+			if (!known) {
+				char body[96];
+				int bp = snprintf(body, sizeof(body),
+				    "iface '%s' is not in any tunnel\n", ifaces[j]);
+				api_send(cli->fd, 404, "text/plain", body, bp);
+				return;
+			}
+		}
+		char ht[8];
+		memcpy(ht, htstr, hl_ht); ht[hl_ht] = 0;
+		if (strcmp(ht, "HT20") && strcmp(ht, "HT40+") && strcmp(ht, "HT40-")) {
+			api_send(cli->fd, 400, "text/plain",
+			    "ht must be HT20|HT40+|HT40-\n", -1);
+			return;
+		}
+		int lead_ms = 500;
+		int t_revert_ms = 3000;
+		(void)qs_get_int(qstr, "lead_ms", &lead_ms);
+		(void)qs_get_int(qstr, "t_revert_ms", &t_revert_ms);
+		if (lead_ms < 100)  lead_ms = 100;
+		if (lead_ms > 5000) lead_ms = 5000;
+		if (t_revert_ms < 500)   t_revert_ms = 500;
+		if (t_revert_ms > 30000) t_revert_ms = 30000;
+		int prev_chan = chan;  /* fallback if operator omits */
+		(void)qs_get_int(qstr, "prev_chan", &prev_chan);
+		size_t pl = 0;
+		const char *pstr = qs_get(qstr, "prev_ht", &pl);
+		char prev_ht[8] = "HT20";
+		if (pstr && pl > 0 && pl < 8) {
+			memcpy(prev_ht, pstr, pl); prev_ht[pl] = 0;
+		}
+		int no_revert = 0;
+		(void)qs_get_int(qstr, "no_revert", &no_revert);
+
+		const Tunnel *up = NULL;
+		for (int i = 0; i < c->tunnel_count; i++) {
+			if (!strcmp(c->tunnels[i].name, c->venc_cmd_uplink) &&
+			    !strcmp(c->tunnels[i].role, "tx")) {
+				up = &c->tunnels[i]; break;
+			}
+		}
+		if (!up || up->udp_in_port <= 0) {
+			api_send(cli->fd, 503, "application/json",
+			    "{\"ok\":false,\"error\":\"uplink tunnel missing\"}", -1);
+			return;
+		}
+
+		/* Arm.  Frame burst is driven by supervisor_tick at 20 ms cadence,
+		 * starting from the next tick. */
+		uint64_t t_us = now_us();
+		g_csa.sess += 1;
+		g_csa.t_switch_us  = t_us + (uint64_t)lead_ms * 1000ULL;
+		g_csa.t_revert_us  = g_csa.t_switch_us +
+		                     (uint64_t)t_revert_ms * 1000ULL;
+		g_csa.next_frame_us = t_us;
+		g_csa.frames_sent  = 0;
+		g_csa.frames_total = 5;
+		g_csa.target_chan  = chan;
+		snprintf(g_csa.target_ht, sizeof(g_csa.target_ht), "%s", ht);
+		g_csa.prev_chan    = prev_chan;
+		snprintf(g_csa.prev_ht,   sizeof(g_csa.prev_ht),   "%s", prev_ht);
+		g_csa.iface_count = iface_count;
+		for (int j = 0; j < iface_count; j++)
+			snprintf(g_csa.ifaces[j], sizeof(g_csa.ifaces[j]),
+			    "%s", ifaces[j]);
+		g_csa.no_revert    = (no_revert != 0);
+		g_csa_seq_in_burst = 0;
+		g_csa.phase = CSA_BURST;
+		LOG_INFO("csa: armed sess=%u ifaces=%d %d→%d (%s→%s) "
+		         "lead=%d ms t_revert=%d ms",
+		         g_csa.sess, g_csa.iface_count,
+		         g_csa.prev_chan, g_csa.target_chan,
+		         g_csa.prev_ht, g_csa.target_ht,
+		         lead_ms, t_revert_ms);
+
+		char body[400];
+		int bp = snprintf(body, sizeof(body),
+		    "{\"ok\":true,\"sess\":%u,\"chan\":%d,\"ht\":\"%s\","
+		    "\"ifaces\":[",
+		    g_csa.sess, chan, ht);
+		for (int j = 0; j < iface_count; j++)
+			bp += snprintf(body + bp, sizeof(body) - bp,
+			    "%s\"%s\"", j ? "," : "", ifaces[j]);
+		bp += snprintf(body + bp, sizeof(body) - bp,
+		    "],\"lead_ms\":%d,\"t_revert_ms\":%d,"
+		    "\"prev_chan\":%d,\"prev_ht\":\"%s\",\"no_revert\":%s}",
+		    lead_ms, t_revert_ms, prev_chan, prev_ht,
+		    no_revert ? "true" : "false");
+		api_send(cli->fd, 200, "application/json", body, bp);
+		return;
+	}
+	if (!strcmp(path, "/api/v1/csa")) {
+		uint64_t t_us = now_us();
+		double t_to_switch_ms = (g_csa.phase == CSA_BURST ||
+		                         g_csa.phase == CSA_ARMED)
+		    ? (double)((int64_t)g_csa.t_switch_us - (int64_t)t_us) / 1000.0
+		    : 0.0;
+		double t_to_revert_ms = (g_csa.phase == CSA_VERIFY)
+		    ? (double)((int64_t)g_csa.t_revert_us - (int64_t)t_us) / 1000.0
+		    : 0.0;
+		char body[400];
+		int bp = snprintf(body, sizeof(body),
+		    "{\"phase\":%d,\"sess\":%u,\"frames_sent\":%d,"
+		    "\"frames_total\":%d,\"target_chan\":%d,\"target_ht\":\"%s\","
+		    "\"prev_chan\":%d,\"prev_ht\":\"%s\",\"ifaces\":[",
+		    (int)g_csa.phase, g_csa.sess, g_csa.frames_sent,
+		    g_csa.frames_total, g_csa.target_chan, g_csa.target_ht,
+		    g_csa.prev_chan, g_csa.prev_ht);
+		for (int j = 0; j < g_csa.iface_count; j++)
+			bp += snprintf(body + bp, sizeof(body) - bp,
+			    "%s\"%s\"", j ? "," : "", g_csa.ifaces[j]);
+		bp += snprintf(body + bp, sizeof(body) - bp,
+		    "],\"t_to_switch_ms\":%.1f,\"t_to_revert_ms\":%.1f,"
+		    "\"no_revert\":%s}",
+		    t_to_switch_ms, t_to_revert_ms,
+		    g_csa.no_revert ? "true" : "false");
+		api_send(cli->fd, 200, "application/json", body, bp);
+		return;
+	}
+	if (!strcmp(path, "/api/v1/system/txpower")) {
+		/* Per-iface `iw set txpower fixed <mBm>` on the GS host. We accept
+		 * any iface that appears in some tunnel's iface list — anything
+		 * else is a typo. The dispatch is synchronous (~30–80 ms on
+		 * RTL88x2CU/EU); keep `mbm` in 50..3000 to match the WCMD clamp.
+		 *
+		 * Useful when the operator notices an adapter dropped to txpower=
+		 * -100 dBm after a monitor-mode flip and wants to restore it
+		 * without reinit, or when probing range vs throughput. */
+		size_t il, ml;
+		const char *istr = qs_get(qstr, "iface", &il);
+		const char *mstr = qs_get(qstr, "mbm",   &ml);
+		if (!istr || !mstr) {
+			api_send(cli->fd, 400, "text/plain",
+			         "missing ?iface=<name>&mbm=<50..3000>\n", -1);
+			return;
+		}
+		char iface[IFNAMSIZ];
+		if (il == 0 || il >= sizeof(iface)) {
+			api_send(cli->fd, 400, "text/plain", "bad iface\n", -1); return;
+		}
+		memcpy(iface, istr, il); iface[il] = 0;
+		bool known = false;
+		for (int i = 0; i < c->tunnel_count && !known; i++) {
+			for (int k = 0; k < c->tunnels[i].iface_count; k++) {
+				if (!strcmp(c->tunnels[i].ifaces[k], iface)) {
+					known = true; break;
+				}
+			}
+		}
+		if (!known) {
+			api_send(cli->fd, 404, "text/plain",
+			         "iface is not in any tunnel\n", -1);
+			return;
+		}
+		int mbm;
+		if (qs_get_int(qstr, "mbm", &mbm) != 0) {
+			api_send(cli->fd, 400, "text/plain", "mbm not numeric\n", -1);
+			return;
+		}
+		if (mbm < 50 || mbm > 3000) {
+			api_send(cli->fd, 400, "text/plain",
+			         "mbm out of range (50..3000)\n", -1);
+			return;
+		}
+		char mbm_s[16];
+		snprintf(mbm_s, sizeof(mbm_s), "%d", mbm);
+		LOG_INFO("REST /system/txpower: iw dev %s set txpower fixed %s",
+		         iface, mbm_s);
+		pid_t pid = fork();
+		int rc = -1;
+		if (pid == 0) {
+			execl("/usr/sbin/iw", "iw", "dev", iface, "set", "txpower",
+			      "fixed", mbm_s, (char*)NULL);
+			execlp("iw", "iw", "dev", iface, "set", "txpower",
+			       "fixed", mbm_s, (char*)NULL);
+			_exit(127);
+		}
+		if (pid > 0) {
+			int st;
+			waitpid(pid, &st, 0);
+			rc = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+		}
+		char body[160];
+		int p = snprintf(body, sizeof(body),
+		                 "{\"ok\":%s,\"iface\":\"%s\",\"mbm\":%d,\"iw_rc\":%d}",
+		                 rc == 0 ? "true" : "false", iface, mbm, rc);
+		api_send(cli->fd, rc == 0 ? 200 : 502, "application/json", body, p);
 		return;
 	}
 	if (!strncmp(path, "/api/v1/tunnels/", 16)) {
@@ -2539,7 +2984,23 @@ int main(int argc, char **argv)
 			}
 		}
 
-		int r = poll(pfds, nfds, 250);
+		/* Default 250 ms tick for the supervisor. Tighten when a CSA
+		 * burst/arm is active so frame cadence and the iw set channel
+		 * fire with sub-10 ms accuracy against the vehicle's csa_tick. */
+		int poll_to_ms = 250;
+		if (g_csa.phase == CSA_BURST || g_csa.phase == CSA_ARMED) {
+			uint64_t now = now_us();
+			uint64_t next = (g_csa.phase == CSA_BURST &&
+			                 g_csa.frames_sent < g_csa.frames_total)
+			    ? g_csa.next_frame_us : g_csa.t_switch_us;
+			int wait = (next > now)
+			    ? (int)((next - now + 999ULL) / 1000ULL) : 1;
+			if (wait < 5) wait = 5;
+			if (wait < poll_to_ms) poll_to_ms = wait;
+		} else if (g_csa.phase == CSA_VERIFY) {
+			poll_to_ms = 50; /* tight enough for revert deadline */
+		}
+		int r = poll(pfds, nfds, poll_to_ms);
 		/* Capture poll's errno before subsequent syscalls clobber it
 		 * (waitpid in supervisor_reap leaves ECHILD on success). */
 		int poll_err = (r < 0) ? errno : 0;

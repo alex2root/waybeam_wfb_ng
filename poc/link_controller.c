@@ -55,6 +55,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -435,6 +436,16 @@ typedef struct {
 		int      wfb_fec_n_min, wfb_fec_n_max;
 		int      wfb_mcs_min,   wfb_mcs_max;
 		int      wfb_bandwidth_min, wfb_bandwidth_max;
+		/* TX power clamp window (millibel-milliwatts; 100 mBm = 1 dBm).
+		 * Default 50..3000 covers everything realistic for our adapters
+		 * (RTL88x2CU/EU). The dispatch fork+execs `iw set txpower fixed`
+		 * against cmd.wfb_iface (or, if empty, csa.iface). */
+		int      wfb_txpower_min;
+		int      wfb_txpower_max;
+		/* WLAN iface that wfb_tx is bound to.  Optional; when empty the
+		 * txpower dispatch falls back to csa.iface. Set explicitly when
+		 * CSA is disabled. */
+		char     wfb_iface[16];
 	} cmd;
 
 	/* ── Common ── */
@@ -1414,7 +1425,29 @@ static int wfb_get_fec(const Config *cfg, int *k_out, int *n_out, int *to_out);
 static int wfb_get_radio(const Config *cfg, RadioBody *out);
 static int wfb_set_radio(const Config *cfg, const RadioBody *params);
 
-#define WCMD_NUM_KEYS 13   /* highest defined WCMD_KEY_* value */
+/* fork+exec `iw dev <iface> set txpower fixed <mBm>`; returns iw's exit
+ * status (0 on success). Synchronous; the call typically returns within
+ * 30–80 ms on RTL88x2CU/EU. */
+static int wfb_run_iw_txpower(const char *iface, int mbm)
+{
+	if (!iface || !iface[0]) return -1;
+	char mbm_s[16];
+	snprintf(mbm_s, sizeof(mbm_s), "%d", mbm);
+	pid_t pid = fork();
+	if (pid < 0) return -1;
+	if (pid == 0) {
+		execl("/usr/sbin/iw", "iw", "dev", iface, "set", "txpower",
+		      "fixed", mbm_s, (char*)NULL);
+		execlp("iw", "iw", "dev", iface, "set", "txpower",
+		       "fixed", mbm_s, (char*)NULL);
+		_exit(127);
+	}
+	int st;
+	waitpid(pid, &st, 0);
+	return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+}
+
+#define WCMD_NUM_KEYS 14   /* highest defined WCMD_KEY_* value */
 
 typedef struct {
 	uint64_t recv_total;        /* every WCMD_REQ that passed magic/version */
@@ -1515,6 +1548,10 @@ static int wcmd_clamp_value(const Config *cfg, uint8_t key, int32_t *value)
 	case WCMD_KEY_FEC_ENABLED:
 	case WCMD_KEY_MCS_ENABLED:
 		lo = 0; hi = 1;
+		break;
+	case WCMD_KEY_WFB_TXPOWER:
+		lo = cfg->cmd.wfb_txpower_min;
+		hi = cfg->cmd.wfb_txpower_max;
 		break;
 	default:
 		return -1;
@@ -1625,6 +1662,53 @@ static int wcmd_dispatch(Config *cfg, const WcmdReq *req,
 		st->accepted++;
 		st->last_status = resp->status;
 		st->last_value  = new_state ? 1 : 0;
+		st->last_http_status = 0;
+		(void)clamp_rc;
+		return 0;
+	}
+
+	/* TX power lives outside the wfb_cmd surface — wfb_tx doesn't expose
+	 * txpower (the radio chip's TX power table is set by the kernel
+	 * driver), so the only way to push it is `iw dev … set txpower fixed`.
+	 * Adaptive MCS does not touch txpower today, so the value sticks
+	 * until the next WCMD or link_controller restart. */
+	if (key == WCMD_KEY_WFB_TXPOWER) {
+		const char *iface = cfg->cmd.wfb_iface[0]
+		    ? cfg->cmd.wfb_iface
+		    : (cfg->csa.iface[0] ? cfg->csa.iface : NULL);
+		if (!iface) {
+			resp->status = WCMD_STATUS_OUT_OF_RANGE;
+			st->rejected_range++;
+			st->last_status = resp->status;
+			return 0;
+		}
+		if (cfg->dry_run) {
+			resp->status = WCMD_STATUS_OK;
+			resp->http_status   = htons(0);
+			resp->applied_value = htonl((uint32_t)value);
+			st->last_apply_us[key] = now;
+			st->accepted++;
+			st->last_status = resp->status;
+			st->last_value  = value;
+			st->last_http_status = 0;
+			return 0;
+		}
+		int rc = wfb_run_iw_txpower(iface, (int)value);
+		if (rc != 0) {
+			resp->status = WCMD_STATUS_HTTP_ERROR;
+			resp->http_status = htons((uint16_t)rc);
+			st->http_errors++;
+			st->last_status = resp->status;
+			st->last_http_status = rc;
+			return 0;
+		}
+		resp->status        = WCMD_STATUS_OK;
+		resp->http_status   = htons(0);
+		resp->applied_value = htonl((uint32_t)value);
+		st->last_apply_us[key] = now;
+		st->accepted++;
+		st->last_status      = resp->status;
+		st->last_value       = value;
 		st->last_http_status = 0;
 		(void)clamp_rc;
 		return 0;
@@ -2471,7 +2555,7 @@ static const TunableDesc TUNABLES[] = {
 	{"cmd.enabled",          SUB_COMMON, TF_BOOL, OFF_CMD(enabled),          0, 0,      "enable venc command proxy on rx_ant socket"},
 	{"cmd.loopback_only",    SUB_COMMON, TF_BOOL, OFF_CMD(loopback_only),    0, 0,      "reject WCMD requests not from 127.0.0.1"},
 	{"cmd.rate_limit_ms",    SUB_COMMON, TF_INT,  OFF_CMD(rate_limit_ms),    0, 60000,  "min ms between same-key applies (0 disables)"},
-	{"cmd.allow_keys_mask",  SUB_COMMON, TF_INT,  OFF_CMD(allow_keys_mask),  0, 0xFFFF, "bitmask of WCMD_KEY_* allowed (1=br,2=fps,4=pl,8=idr,16=fec_k,32=fec_n,64=mcs,128=bw,256=ldpc,512=stbc,1024=sgi,2048=fec_en,4096=mcs_en)"},
+	{"cmd.allow_keys_mask",  SUB_COMMON, TF_INT,  OFF_CMD(allow_keys_mask),  0, 0xFFFF, "bitmask of WCMD_KEY_* allowed (1=br,2=fps,4=pl,8=idr,16=fec_k,32=fec_n,64=mcs,128=bw,256=ldpc,512=stbc,1024=sgi,2048=fec_en,4096=mcs_en,8192=txpower)"},
 	{"cmd.bitrate_min_kbps", SUB_COMMON, TF_INT,  OFF_CMD(bitrate_min_kbps), 1, 200000, "min accepted bitrate kbps (fallback when fec disabled)"},
 	{"cmd.bitrate_max_kbps", SUB_COMMON, TF_INT,  OFF_CMD(bitrate_max_kbps), 1, 200000, "max accepted bitrate kbps (fallback when fec disabled)"},
 	{"cmd.fps_min",          SUB_COMMON, TF_INT,  OFF_CMD(fps_min),          1, 240,    "min accepted fps"},
@@ -2486,6 +2570,8 @@ static const TunableDesc TUNABLES[] = {
 	{"cmd.wfb_mcs_max",      SUB_COMMON, TF_INT,  OFF_CMD(wfb_mcs_max),      0, 31,  "max accepted wfb_tx MCS index"},
 	{"cmd.wfb_bandwidth_min",SUB_COMMON, TF_INT,  OFF_CMD(wfb_bandwidth_min),5, 80,  "min accepted wfb_tx bandwidth (MHz)"},
 	{"cmd.wfb_bandwidth_max",SUB_COMMON, TF_INT,  OFF_CMD(wfb_bandwidth_max),5, 80,  "max accepted wfb_tx bandwidth (MHz)"},
+	{"cmd.wfb_txpower_min",  SUB_COMMON, TF_INT,  OFF_CMD(wfb_txpower_min),  1, 4000,"min accepted iw txpower (mBm; 100=1 dBm)"},
+	{"cmd.wfb_txpower_max",  SUB_COMMON, TF_INT,  OFF_CMD(wfb_txpower_max),  1, 4000,"max accepted iw txpower (mBm; 100=1 dBm)"},
 };
 #define TUNABLES_COUNT (sizeof(TUNABLES) / sizeof(TUNABLES[0]))
 
@@ -3019,7 +3105,8 @@ static int cmd_status_to_json(const ApiSnapshot *s, char *buf, size_t cap)
 			"\"wfb_fec_k\":%.3f,\"wfb_fec_n\":%.3f,"
 			"\"wfb_mcs\":%.3f,\"wfb_bandwidth\":%.3f,"
 			"\"wfb_ldpc\":%.3f,\"wfb_stbc\":%.3f,\"wfb_short_gi\":%.3f,"
-			"\"fec_enabled\":%.3f,\"mcs_enabled\":%.3f"
+			"\"fec_enabled\":%.3f,\"mcs_enabled\":%.3f,"
+			"\"wfb_txpower\":%.3f"
 		"}}",
 		log_rel_s(),
 		(w ? "true" : "false"),
@@ -3054,7 +3141,8 @@ static int cmd_status_to_json(const ApiSnapshot *s, char *buf, size_t cap)
 		last_apply_age[WCMD_KEY_WFB_STBC],
 		last_apply_age[WCMD_KEY_WFB_SHORT_GI],
 		last_apply_age[WCMD_KEY_FEC_ENABLED],
-		last_apply_age[WCMD_KEY_MCS_ENABLED]);
+		last_apply_age[WCMD_KEY_MCS_ENABLED],
+		last_apply_age[WCMD_KEY_WFB_TXPOWER]);
 	if (n < 0 || (size_t)n >= cap) return -1;
 	return n;
 }
@@ -3819,7 +3907,7 @@ static void config_defaults(Config *c)
 	c->cmd.enabled         = true;
 	c->cmd.loopback_only   = false;
 	c->cmd.rate_limit_ms   = 100;
-	c->cmd.allow_keys_mask = 0x1FFF;     /* keys 1..13 enabled */
+	c->cmd.allow_keys_mask = 0x3FFF;     /* keys 1..14 enabled */
 	c->cmd.bitrate_min_kbps = 100;
 	c->cmd.bitrate_max_kbps = 25000;
 	c->cmd.fps_min          = 1;
@@ -3837,6 +3925,12 @@ static void config_defaults(Config *c)
 	c->cmd.wfb_mcs_max       = 11;
 	c->cmd.wfb_bandwidth_min = 5;
 	c->cmd.wfb_bandwidth_max = 80;
+	/* TX power range in mBm (millibel-milliwatts). 50..3000 covers the
+	 * regulatory/hardware envelope of all supported adapters; the iw
+	 * driver itself will clip to the per-channel max. */
+	c->cmd.wfb_txpower_min   = 50;
+	c->cmd.wfb_txpower_max   = 3000;
+	c->cmd.wfb_iface[0]      = '\0';
 }
 
 /* ─────────────────────────────────────────────────────────────────────
@@ -3871,6 +3965,8 @@ int main(int argc, char **argv)
 		/* csa */
 		OPT_CSA_IFACE, OPT_CSA_ALLOWLIST, OPT_CSA_BANDWIDTH,
 		OPT_CSA_COOLDOWN, OPT_CSA_NO_REVERT,
+		/* cmd */
+		OPT_WFB_IFACE,
 	};
 	static const struct option longopts[] = {
 		{"wfb",            required_argument, 0, OPT_WFB},
@@ -3929,6 +4025,7 @@ int main(int argc, char **argv)
 		{"csa-bandwidth",  required_argument, 0, OPT_CSA_BANDWIDTH},
 		{"csa-cooldown-ms",required_argument, 0, OPT_CSA_COOLDOWN},
 		{"csa-no-revert",  no_argument,       0, OPT_CSA_NO_REVERT},
+		{"wfb-iface",      required_argument, 0, OPT_WFB_IFACE},
 		{"verbose",        no_argument,       0, 'v'},
 		{"help",           no_argument,       0, 'h'},
 		{0, 0, 0, 0},
@@ -4080,6 +4177,10 @@ int main(int argc, char **argv)
 			break;
 		case OPT_CSA_NO_REVERT:
 			cfg.csa.no_revert = true;
+			break;
+		case OPT_WFB_IFACE:
+			snprintf(cfg.cmd.wfb_iface, sizeof(cfg.cmd.wfb_iface),
+			         "%s", optarg);
 			break;
 		case 'v':                cfg.verbose = 1; break;
 		case 'h': default: usage(argv[0]); return (ch == 'h') ? 0 : 1;

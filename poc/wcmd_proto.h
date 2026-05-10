@@ -79,6 +79,18 @@
 #define WCMD_KEY_FEC_ENABLED    12   /* link_controller fec.enabled (0/1) */
 #define WCMD_KEY_MCS_ENABLED    13   /* link_controller mcs.enabled (0/1) */
 
+/*
+ * Vehicle WLAN adapter TX power, in millibel-milliwatts (mBm), the unit
+ * accepted by `iw dev <iface> set txpower fixed <N>` (100 mBm = 1 dBm).
+ * Dispatched by link_controller as a fork+exec of `iw` against the iface
+ * configured under cmd.wfb_iface (falling back to csa.iface when unset).
+ * Honoured even when fec/mcs are off — txpower is unrelated to adaptive
+ * subsystems and applies straight to the radio. Adaptive MCS does not
+ * touch txpower today, so the value sticks until the next WCMD or
+ * link_controller restart.
+ */
+#define WCMD_KEY_WFB_TXPOWER    14   /* iw set txpower fixed <mBm> */
+
 /* Status codes returned in CMD_RESP */
 #define WCMD_STATUS_OK           0
 #define WCMD_STATUS_DISABLED     1   /* cmd subsystem off (cmd.enabled=false) */
