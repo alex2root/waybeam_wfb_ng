@@ -68,7 +68,7 @@
 #define GS_MAX_TUNNELS       8
 #define GS_MAX_IFACES        4
 #define GS_MAX_EXTRA_ARGS   16
-#define GS_MAX_SYSTEM_CMDS   8
+#define GS_MAX_SYSTEM_CMDS  32
 #define GS_NAME_MAX         32
 #define GS_PATH_MAX        256
 #define GS_ARG_MAX         128
@@ -347,6 +347,7 @@ typedef enum {
 typedef struct {
 	char        name[GS_NAME_MAX];
 	char        role[4];               /* "rx" or "tx" */
+	char        binary[GS_PATH_MAX];   /* override executable; "" = wfb_rx / wfb_tx */
 	int         link_id;
 	int         radio_port;
 
@@ -354,7 +355,7 @@ typedef struct {
 	char        ifaces[GS_MAX_IFACES][IFNAMSIZ];
 
 	/* rx-only */
-	char        udp_out_ip[GS_ARG_MAX];
+	char        udp_out_ip[GS_ARG_MAX]; /* "" = leave -c/-u to wfb_rx defaults */
 	int         udp_out_port;
 	char        stats_out[GS_ARG_MAX]; /* "ip:port" or empty */
 
@@ -363,7 +364,7 @@ typedef struct {
 	int         control_port;
 	int         fec_k, fec_n;
 	int         bandwidth_mhz;
-	int         mcs_index;
+	int         mcs_index;             /* -1 = unset */
 	int         stbc;                  /* -1 = unset */
 	int         ldpc;                  /* -1 = unset */
 
@@ -420,7 +421,7 @@ static const char *tunnel_state_name(TunnelState s)
 static int cfg_parse_tunnel(const char *js, JTok *toks, int n, int t_idx, Tunnel *t)
 {
 	memset(t, 0, sizeof(*t));
-	t->stbc = -1; t->ldpc = -1;
+	t->mcs_index = -1; t->stbc = -1; t->ldpc = -1;
 	t->autostart = true;
 
 	int v;
@@ -471,15 +472,21 @@ static int cfg_parse_tunnel(const char *js, JTok *toks, int n, int t_idx, Tunnel
 		t->autostart = bv;
 	}
 
+	if ((v = jfind(js, toks, n, t_idx, "binary")) >= 0) {
+		if (jstr(js, &toks[v], t->binary, sizeof(t->binary)) < 0) return -1;
+	}
+
 	if (!strcmp(t->role, "rx")) {
-		if ((v = jfind(js, toks, n, t_idx, "udp_out")) < 0) return -1;
-		if (jstr(js, &toks[v], tmp, sizeof(tmp)) < 0) return -1;
-		char *colon = strchr(tmp, ':');
-		if (!colon) return -1;
-		*colon = 0;
-		snprintf(t->udp_out_ip, sizeof(t->udp_out_ip), "%s", tmp);
-		t->udp_out_port = atoi(colon + 1);
-		if (t->udp_out_port <= 0 || t->udp_out_port > 65535) return -1;
+		/* udp_out is optional — wfb_rx defaults to 127.0.0.1:5600. */
+		if ((v = jfind(js, toks, n, t_idx, "udp_out")) >= 0) {
+			if (jstr(js, &toks[v], tmp, sizeof(tmp)) < 0) return -1;
+			char *colon = strchr(tmp, ':');
+			if (!colon) return -1;
+			*colon = 0;
+			snprintf(t->udp_out_ip, sizeof(t->udp_out_ip), "%s", tmp);
+			t->udp_out_port = atoi(colon + 1);
+			if (t->udp_out_port <= 0 || t->udp_out_port > 65535) return -1;
+		}
 
 		if ((v = jfind(js, toks, n, t_idx, "stats_out")) >= 0) {
 			if (jstr(js, &toks[v], t->stats_out, sizeof(t->stats_out)) < 0)
@@ -578,7 +585,11 @@ static int cfg_load(const char *path, Config *c)
 		int up = jfind(buf, toks, n, sys_idx, "up");
 		if (up >= 0 && toks[up].type == JT_ARR) {
 			int kids = toks[up].size;
-			if (kids > GS_MAX_SYSTEM_CMDS) kids = GS_MAX_SYSTEM_CMDS;
+			if (kids > GS_MAX_SYSTEM_CMDS) {
+				LOG_ERR("config: system.up has %d entries, max %d",
+				        kids, GS_MAX_SYSTEM_CMDS);
+				free(buf); return -1;
+			}
 			int ci = up + 1;
 			for (int k = 0; k < kids; k++) {
 				jstr(buf, &toks[ci], c->system_up[k], GS_PATH_MAX);
@@ -589,7 +600,11 @@ static int cfg_load(const char *path, Config *c)
 		int dn = jfind(buf, toks, n, sys_idx, "down");
 		if (dn >= 0 && toks[dn].type == JT_ARR) {
 			int kids = toks[dn].size;
-			if (kids > GS_MAX_SYSTEM_CMDS) kids = GS_MAX_SYSTEM_CMDS;
+			if (kids > GS_MAX_SYSTEM_CMDS) {
+				LOG_ERR("config: system.down has %d entries, max %d",
+				        kids, GS_MAX_SYSTEM_CMDS);
+				free(buf); return -1;
+			}
 			int ci = dn + 1;
 			for (int k = 0; k < kids; k++) {
 				jstr(buf, &toks[ci], c->system_down[k], GS_PATH_MAX);
@@ -662,11 +677,13 @@ static int ab_push(ArgvBuilder *ab, const char *fmt, ...)
 
 static int build_argv_rx(const Tunnel *t, const char *key_file, ArgvBuilder *ab)
 {
-	if (ab_push(ab, "wfb_rx") < 0) return -1;
+	if (ab_push(ab, "%s", t->binary[0] ? t->binary : "wfb_rx") < 0) return -1;
 	if (key_file && key_file[0] && (ab_push(ab, "-K") < 0 || ab_push(ab, "%s", key_file) < 0))
 		return -1;
-	if (ab_push(ab, "-c") < 0 || ab_push(ab, "%s", t->udp_out_ip) < 0) return -1;
-	if (ab_push(ab, "-u") < 0 || ab_push(ab, "%d", t->udp_out_port) < 0) return -1;
+	if (t->udp_out_ip[0]) {
+		if (ab_push(ab, "-c") < 0 || ab_push(ab, "%s", t->udp_out_ip) < 0) return -1;
+		if (ab_push(ab, "-u") < 0 || ab_push(ab, "%d", t->udp_out_port) < 0) return -1;
+	}
 	if (ab_push(ab, "-i") < 0 || ab_push(ab, "%d", t->link_id) < 0) return -1;
 	if (ab_push(ab, "-p") < 0 || ab_push(ab, "%d", t->radio_port) < 0) return -1;
 	if (t->stats_out[0]) {
@@ -682,7 +699,7 @@ static int build_argv_rx(const Tunnel *t, const char *key_file, ArgvBuilder *ab)
 
 static int build_argv_tx(const Tunnel *t, const char *key_file, ArgvBuilder *ab)
 {
-	if (ab_push(ab, "wfb_tx") < 0) return -1;
+	if (ab_push(ab, "%s", t->binary[0] ? t->binary : "wfb_tx") < 0) return -1;
 	if (key_file && key_file[0] && (ab_push(ab, "-K") < 0 || ab_push(ab, "%s", key_file) < 0))
 		return -1;
 	if (ab_push(ab, "-i") < 0 || ab_push(ab, "%d", t->link_id) < 0) return -1;
@@ -937,8 +954,10 @@ static int json_emit_tunnel(char *buf, size_t cap, const Tunnel *t, bool full)
 	if (t->exit_code || t->exited_us)
 		APP(",\"last_exit\":%d", t->exit_code);
 	if (full) {
+		if (t->binary[0]) APP(",\"binary\":\"%s\"", t->binary);
 		if (!strcmp(t->role, "rx")) {
-			APP(",\"udp_out\":\"%s:%d\"", t->udp_out_ip, t->udp_out_port);
+			if (t->udp_out_ip[0])
+				APP(",\"udp_out\":\"%s:%d\"", t->udp_out_ip, t->udp_out_port);
 			if (t->stats_out[0]) APP(",\"stats_out\":\"%s\"", t->stats_out);
 		} else {
 			APP(",\"udp_in_port\":%d,\"control_port\":%d,"
@@ -1184,12 +1203,16 @@ int main(int argc, char **argv)
 
 	while (!g_shutdown) {
 		struct pollfd pfds[1 + API_MAX_CLIENTS];
+		int           pfd_slot[1 + API_MAX_CLIENTS];   /* -1 = listener */
 		int nfds = 0;
-		pfds[nfds].fd = api_fd; pfds[nfds].events = POLLIN; nfds++;
+		pfds[nfds].fd = api_fd; pfds[nfds].events = POLLIN;
+		pfd_slot[nfds] = -1;
+		nfds++;
 		for (int i = 0; i < API_MAX_CLIENTS; i++) {
 			if (clients[i].fd >= 0) {
 				pfds[nfds].fd = clients[i].fd;
 				pfds[nfds].events = POLLIN;
+				pfd_slot[nfds] = i;
 				nfds++;
 			}
 		}
@@ -1209,8 +1232,7 @@ int main(int argc, char **argv)
 		}
 		if (r == 0) continue;
 
-		int idx = 0;
-		if (pfds[idx++].revents & POLLIN) {
+		if (pfds[0].revents & POLLIN) {
 			struct sockaddr_in peer; socklen_t plen = sizeof(peer);
 			int cfd = accept(api_fd, (struct sockaddr *)&peer, &plen);
 			if (cfd >= 0) {
@@ -1228,13 +1250,20 @@ int main(int argc, char **argv)
 				}
 			}
 		}
-		for (int i = 0; i < API_MAX_CLIENTS; i++) {
-			if (clients[i].fd < 0) continue;
-			if (!(pfds[idx].revents & (POLLIN | POLLERR | POLLHUP))) { idx++; continue; }
-			idx++;
+		/* Iterate over the pfds we actually polled, not over slot indices.
+		 * A client just accepted in this iteration is NOT in pfds; reading
+		 * pfds[idx] for it was an out-of-bounds garbage fetch that could
+		 * trigger a spurious recv() returning EAGAIN, then close the fresh
+		 * socket — symptom: "Empty reply from server". */
+		for (int p = 1; p < nfds; p++) {
+			int i = pfd_slot[p];
+			if (i < 0 || clients[i].fd < 0) continue;
+			short re = pfds[p].revents;
+			if (!(re & (POLLIN | POLLERR | POLLHUP))) continue;
 			ssize_t got = recv(clients[i].fd,
 			                   clients[i].buf + clients[i].pos,
 			                   sizeof(clients[i].buf) - clients[i].pos - 1, 0);
+			if (got < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;
 			if (got <= 0) {
 				close(clients[i].fd); clients[i].fd = -1; continue;
 			}

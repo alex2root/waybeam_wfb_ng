@@ -56,4 +56,4 @@ deploy: $(OUT_CROSS)
 	scp $(OUT_CROSS) root@$(DEPLOY_HOST):$(DEPLOY_DIR)/
 
 clean:
-	rm -rf $(BUILD_DIR)
+	rm -f $(OUT_HOST) $(OUT_CROSS)
