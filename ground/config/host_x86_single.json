@@ -2,7 +2,6 @@
   "_comment": "Host x86 ground station — two RTL88x2 USB adapters, both on channel 161.",
   "_comment_iface_a": "wlx40a5ef2f229b — RX-only diversity adapter",
   "_comment_iface_b": "wlx40a5ef2f2308 — RX diversity + uplink TX",
-  "_comment_nm": "Both adapters are pinned NM-unmanaged in /etc/NetworkManager/conf.d/99-wfb-unmanaged.conf (by MAC), so no nmcli managed toggling is needed here — that toggling raced NM and intermittently left an adapter in 'managed' after 'ip link up'.",
 
   "key_file": "/etc/drone.key",
 
