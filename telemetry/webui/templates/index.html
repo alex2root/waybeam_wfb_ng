@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}sessions · wfb telemetry{% endblock %}
+{% block content %}
+<h1>Sessions</h1>
+{% if not sessions %}
+  <p class="empty">No sessions yet. Import a capture:
+    <code>python3 telemetry/wfb_store.py import telemetry/real_wfb.jsonl</code>
+    or run <code>wfb_ingest.py</code> on a live tap.</p>
+{% else %}
+<table class="sessions">
+  <thead><tr>
+    <th>#</th><th>source</th><th>scenario</th><th>records</th><th>span</th>
+    <th>started</th><th>location</th><th>notes</th>
+  </tr></thead>
+  <tbody>
+  {% for s in sessions %}
+    <tr onclick="location.href='{{ url_for('session', sid=s.id) }}'">
+      <td>{{ s.id }}</td>
+      <td>{{ s.source or '—' }}</td>
+      <td>{{ s.scenario or '—' }}</td>
+      <td class="num">{{ s.n_records }}</td>
+      <td class="num">{% if s.first_ts is not none and s.last_ts is not none %}
+        {{ '%.1f'|format((s.last_ts - s.first_ts) / 1000) }}s{% else %}—{% endif %}</td>
+      <td>{{ s.started_at or '—' }}</td>
+      <td>{{ s.location or '—' }}</td>
+      <td>{{ s.notes or '—' }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% endblock %}

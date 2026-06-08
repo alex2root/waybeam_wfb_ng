@@ -90,6 +90,14 @@ docs/                    design notes + protocol specs
 tests/                   default = wire-format conformance (58 tests)
   protocols/               frozen Python parsers vendored under _proto/
 
+telemetry/               link-adaptation ML + analysis tooling (Python, dev-side)
+  train_tier1.py           trains the Tier-1 decision tree -> tier1_model.c (SSC338Q)
+  wfb_schema.py            schema-agnostic wfb_rx -Y flattener + trend features
+  wfb_link_score.py        controller-aligned effective-RSSI / bucket-FSM replica
+  probe/                   FEC-off MCS-ladder PER probe (measured link headroom)
+  webui/, wfb_store.py     SQLite data-session store + Flask/uPlot browse-&-label UI
+  README.md                full guide (Tier-2 needs the gemma4-local Ollama box; HTTP)
+
 archive/                 superseded code (kept in-tree for reference)
   python/                  fec_controller/ + mcs_selector/ + 328 legacy tests
   c-poc/                   standalone C variants subsumed by link_controller
@@ -98,6 +106,12 @@ archive/                 superseded code (kept in-tree for reference)
 FOLLOWUPS.md             deferred polish across both daemons
 Makefile                 top-level umbrella (make all / test / clean)
 ```
+
+> **`telemetry/`** holds the link-telemetry analysis + Tier-1 training work (relocated
+> from the `gemma4-local` repo). Its trained C model (`tier1_model.c` + `tier1_trend.h`)
+> is the artifact destined for the `link_controller` / `gs_supervisor` decision loop.
+> Tier-2 explanations call the local Gemma box over HTTP; Tier-1 is dependency-free.
+> See `telemetry/README.md`.
 
 ## Quickstart
 

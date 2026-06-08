@@ -1,0 +1,4 @@
+# Web UI for the data-session store (DATASTORE.md). Training-box only — the
+# SSC338Q never runs this, and wfb_store.py / the ingester are stdlib-only.
+# Charting (uPlot) is vendored static JS, not a pip dep.
+Flask>=3.0
