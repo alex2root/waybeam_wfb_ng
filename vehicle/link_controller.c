@@ -366,6 +366,18 @@ typedef struct {
 		/* Behavior */
 		bool     start_low;
 		bool     enabled;
+
+		/* ── Boundary-probe control law (mode=1) ──
+		 * Reactive-demote on live video PER + V+2 probe-driven promote /
+		 * conservative pre-emptive demote. See MCS_STRATEGY.md. */
+		int      mode;              /* 0 = bucket (legacy), 1 = probe       */
+		int      mcs_start;         /* probe-mode cold-start MCS            */
+		int      probe_clean_milli; /* V+2 PER <= this (‰) -> promote-ok    */
+		int      probe_fail_milli;  /* V+2 PER >= this (‰) -> pre-empt demote*/
+		int      demote_per_milli;  /* live video PER >= this (‰) -> demote */
+		float    promote_dwell_s;   /* min dwell before a probe promote     */
+		float    probe_window_s;    /* nominal probe PER window (info)      */
+		float    probe_stale_age_s; /* ignore probe rungs older than this   */
 	} mcs;
 
 	/* ── CSA subsystem (Channel Switch Announcement receiver) ──
@@ -2383,6 +2395,31 @@ typedef struct {
 	uint32_t  commit_count;
 } Selector;
 
+/* ── Boundary-probe PER state (2026-06-08 control law) ───────────────────
+ * The vehicle drives a probe wfb_tx at the V+2 boundary rung; the GS measures
+ * per-rung PER and forwards `{"type":"probe",...}` records up the same rx_ant
+ * tunnel. Phase 1 records + surfaces them only — no decision use yet. Indexed
+ * by absolute MCS so a swept/multi-rung prototype feed lands cleanly too. */
+#define PROBE_MCS_MAX 16
+typedef struct {
+	long     accounted;   /* recv+lost in the latest window for this rung   */
+	long     lost;
+	int      per_milli;   /* lost*1000/accounted, rounded; -1 = no traffic  */
+	uint64_t last_us;     /* local rx time of the latest record (staleness) */
+	uint64_t ts_ms;       /* producer-side timestamp from the record        */
+	uint32_t records;     /* total records seen at this rung                */
+	bool     valid;       /* at least one record observed                  */
+} ProbeRung;
+
+typedef struct {
+	ProbeRung rung[PROBE_MCS_MAX];
+	uint64_t  last_any_us;   /* local rx time of any probe record  */
+	uint32_t  total_records;
+	uint32_t  parse_errors;
+} ProbeState;
+
+static inline void probe_state_init(ProbeState *p) { memset(p, 0, sizeof(*p)); }
+
 typedef enum {
 	SD_NONE = 0, SD_INIT, SD_DOWN, SD_UP, SD_FAILSAFE, SD_RECOVERED
 } SelectDecision;
@@ -2464,6 +2501,29 @@ static SelectDecision selector_commit(Selector *s, const Config *cfg,
 	return reason;
 }
 
+/* Commit an ABSOLUTE mcs index (probe control law). Clamps to [mcs_min,mcs_max],
+ * leaves current_bucket = -1 (buckets are unused in probe mode), and shares the
+ * oscillation ring + change accounting with the bucket path. */
+static SelectDecision selector_commit_mcs(Selector *s, const Config *cfg,
+                                          int target_mcs, uint64_t now,
+                                          SelectDecision reason, int *out_mcs)
+{
+	if (target_mcs < cfg->mcs.mcs_min) target_mcs = cfg->mcs.mcs_min;
+	if (target_mcs > cfg->mcs.mcs_max) target_mcs = cfg->mcs.mcs_max;
+	int prev = s->current_mcs;
+	s->current_bucket = -1;
+	s->current_mcs = target_mcs;
+	if (prev != s->current_mcs) {
+		s->last_change_us = now;
+		selector_record_change(s, cfg, now);
+		s->commit_count++;
+	}
+	s->pending_bucket = -1;
+	s->pending_streak = 0;
+	*out_mcs = s->current_mcs;
+	return reason;
+}
+
 static SelectDecision selector_tick_no_data(Selector *s, const Config *cfg,
                                             uint64_t now, int *out_mcs)
 {
@@ -2474,10 +2534,13 @@ static SelectDecision selector_tick_no_data(Selector *s, const Config *cfg,
 	if (gap < (uint64_t)(cfg->mcs.failsafe_timeout_s * 1e6f)) return SD_NONE;
 	if (s->in_failsafe && s->current_bucket == 0) return SD_NONE;
 
-	LOG_MCS("failsafe: no rx_ant for %.2fs (>%.2fs) — forcing bucket 0",
+	LOG_MCS("failsafe: no rx_ant for %.2fs (>%.2fs) — forcing lowest MCS",
 	    (double)gap / 1e6, (double)cfg->mcs.failsafe_timeout_s);
 	s->in_failsafe = true;
 	s->recovery_streak = 0;
+	if (cfg->mcs.mode == 1)
+		return selector_commit_mcs(s, cfg, cfg->mcs.mcs_min, now,
+		                           SD_FAILSAFE, out_mcs);
 	return selector_commit(s, cfg, 0, now, SD_FAILSAFE, out_mcs);
 }
 
@@ -2540,6 +2603,69 @@ static SelectDecision selector_update(Selector *s, const Config *cfg,
 		cooldown *= cfg->mcs.oscillation_backoff;
 	if (elapsed < cooldown) return SD_NONE;
 	return selector_commit(s, cfg, candidate, now, SD_UP, out_mcs);
+}
+
+/* Boundary-probe control law (mode=1). Called once per video rx_ant datagram
+ * (the fast clock); reads the latest V+2 probe rung as an async side input.
+ *   - reactive demote: live video PER spike (fast/deep backstop)
+ *   - promote: V+2 clean  -> +1 viable by monotonicity -> step up 1
+ *   - pre-emptive demote: V+2 fails while video healthy -> step down 1 to
+ *     restore the +2 cushion (conservative; preempt_margin = +2 everywhere)
+ * The probe drives only up/hold; the down floor (states 3-4) is video PER. */
+static SelectDecision selector_update_probe(Selector *s, const Config *cfg,
+                                            const Score *score,
+                                            const ProbeState *probe,
+                                            uint64_t now, int *out_mcs)
+{
+	s->last_datagram_us = now;
+
+	/* Data is flowing again — clear any watchdog failsafe; the probe will
+	 * climb back up from mcs_min. */
+	if (s->in_failsafe) { s->in_failsafe = false; s->recovery_streak = 0; }
+
+	/* Cold start: begin low and let the probe promote upward. */
+	if (s->current_mcs < 0)
+		return selector_commit_mcs(s, cfg, cfg->mcs.mcs_start, now,
+		                           SD_INIT, out_mcs);
+
+	float elapsed = (float)(now - s->last_change_us) / 1e6f;
+
+	/* 1. REACTIVE DEMOTE — live video PER spike. smoothed_lost_ratio is a
+	 *    fraction (0..1); compare in per-mille. Fast/deep backstop; can
+	 *    cascade rung-by-rung at the rx_ant rate. */
+	if (score->smoothed_lost_ratio * 1000.0f >= (float)cfg->mcs.demote_per_milli) {
+		if (s->current_mcs > cfg->mcs.mcs_min &&
+		    elapsed >= cfg->mcs.down_cooldown_s)
+			return selector_commit_mcs(s, cfg, s->current_mcs - 1, now,
+			                           SD_DOWN, out_mcs);
+		return SD_NONE;  /* at floor or cooling down */
+	}
+
+	/* 2. PROBE-DRIVEN promote / pre-emptive demote at the V+2 boundary. */
+	int v2 = s->current_mcs + 2;
+	if (v2 >= 0 && v2 < PROBE_MCS_MAX) {
+		const ProbeRung *pr = &probe->rung[v2];
+		float age = pr->valid ? (float)(now - pr->last_us) / 1e6f : 1e9f;
+		if (pr->valid && pr->per_milli >= 0 &&
+		    age <= cfg->mcs.probe_stale_age_s) {
+			if (pr->per_milli <= cfg->mcs.probe_clean_milli) {
+				/* +2 clean -> +1 guaranteed viable (monotonic) -> promote. */
+				if (s->current_mcs < cfg->mcs.mcs_max &&
+				    elapsed >= cfg->mcs.promote_dwell_s)
+					return selector_commit_mcs(s, cfg, s->current_mcs + 1,
+					                           now, SD_UP, out_mcs);
+			} else if (pr->per_milli >= cfg->mcs.probe_fail_milli) {
+				/* +2 fail while video healthy -> conservative demote 1. */
+				if (s->current_mcs > cfg->mcs.mcs_min &&
+				    elapsed >= cfg->mcs.down_cooldown_s)
+					return selector_commit_mcs(s, cfg, s->current_mcs - 1,
+					                           now, SD_DOWN, out_mcs);
+			}
+			/* clean < per < fail -> hold */
+		}
+		/* stale / no probe -> hold (RSSI fade-rate fallback is Phase 3) */
+	}
+	return SD_NONE;
 }
 
 /* ─────────────────────────────────────────────────────────────────────
@@ -2629,6 +2755,14 @@ static const TunableDesc TUNABLES[] = {
 	{"mcs.mcs_min",                       SUB_MCS, TF_INT,   OFF_MCS(mcs_min),                       0, 11,      "clamp emit lower bound"},
 	{"mcs.mcs_max",                       SUB_MCS, TF_INT,   OFF_MCS(mcs_max),                       0, 11,      "clamp emit upper bound"},
 	{"mcs.start_low",                     SUB_MCS, TF_BOOL,  OFF_MCS(start_low),                     0, 0,       "force range[0] mcs at startup (default off)"},
+	{"mcs.mode",                          SUB_MCS, TF_INT,   OFF_MCS(mode),                          0, 1,       "0=bucket FSM (legacy), 1=boundary-probe control law"},
+	{"mcs.mcs_start",                     SUB_MCS, TF_INT,   OFF_MCS(mcs_start),                     0, 11,      "probe mode: cold-start MCS index"},
+	{"mcs.probe_clean_milli",             SUB_MCS, TF_INT,   OFF_MCS(probe_clean_milli),             0, 1000,    "probe: V+2 PER <= this permille -> promote-eligible"},
+	{"mcs.probe_fail_milli",              SUB_MCS, TF_INT,   OFF_MCS(probe_fail_milli),              0, 1000,    "probe: V+2 PER >= this permille -> pre-emptive demote"},
+	{"mcs.demote_per_milli",              SUB_MCS, TF_INT,   OFF_MCS(demote_per_milli),              0, 1000,    "probe: live video PER >= this permille -> reactive demote"},
+	{"mcs.promote_dwell_s",               SUB_MCS, TF_FLOAT, OFF_MCS(promote_dwell_s),               0.0, 60.0,  "probe: min dwell before a promote"},
+	{"mcs.probe_window_s",                SUB_MCS, TF_FLOAT, OFF_MCS(probe_window_s),                0.05, 10.0, "probe: nominal PER window (informational)"},
+	{"mcs.probe_stale_age_s",             SUB_MCS, TF_FLOAT, OFF_MCS(probe_stale_age_s),             0.1, 30.0,  "probe: ignore V+2 rungs older than this"},
 
 	/* ── cmd (venc command proxy on the rx_ant socket) ── */
 	{"cmd.enabled",          SUB_COMMON, TF_BOOL, OFF_CMD(enabled),          0, 0,      "enable venc command proxy on rx_ant socket"},
@@ -2859,6 +2993,8 @@ typedef struct {
 	int      pending_drop_ms_remaining;
 	/* venc command proxy snapshot (multiplexed onto rx_ant socket). */
 	const WcmdState *wcmd;
+	/* Boundary-probe PER snapshot (read-only; Phase 1 observability). */
+	const ProbeState *probe;
 } ApiSnapshot;
 
 static int append_score_json(char *buf, size_t cap, size_t pos,
@@ -3020,6 +3156,16 @@ static int append_mcs_json(char *buf, size_t cap, size_t pos,
 	double rx_age_s = s->last_rx_ant_us == 0
 		? -1.0
 		: (double)(now_us() - s->last_rx_ant_us) / 1e6;
+	/* Boundary-probe summary: surface the V+2 rung (the one the control
+	 * law will gate on) plus aggregate counters. Phase 1 = observability. */
+	uint64_t now = now_us();
+	int v2 = s->sel->current_mcs + 2;
+	const ProbeRung *pr = (s->probe && v2 >= 0 && v2 < PROBE_MCS_MAX
+	                       && s->probe->rung[v2].valid)
+	                      ? &s->probe->rung[v2] : NULL;
+	double probe_age_s = (s->probe && s->probe->last_any_us)
+	                     ? (double)(now - s->probe->last_any_us) / 1e6 : -1.0;
+	double v2_age_s = pr ? (double)(now - pr->last_us) / 1e6 : -1.0;
 	int n = snprintf(buf + pos, cap - pos,
 		"\"mcs\":{\"enabled\":%s,\"current_bucket\":%d,\"current_mcs\":%d,"
 		"\"in_failsafe\":%s,\"recovery_streak\":%d,"
@@ -3027,7 +3173,9 @@ static int append_mcs_json(char *buf, size_t cap, size_t pos,
 		"\"commit_count\":%u,\"changes_in_window\":%d,"
 		"\"last_emit_mcs\":%d,\"rx_ant_age_s\":%.3f,"
 		"\"bitrate_lead_s\":%.3f,"
-		"\"pending_drop\":{\"active\":%s,\"target_mcs\":%d,\"ms_remaining\":%d}}",
+		"\"pending_drop\":{\"active\":%s,\"target_mcs\":%d,\"ms_remaining\":%d},"
+		"\"probe\":{\"records\":%u,\"parse_errors\":%u,\"age_s\":%.3f,"
+		"\"v2_mcs\":%d,\"v2_per_milli\":%d,\"v2_accounted\":%ld,\"v2_age_s\":%.3f}}",
 		s->cfg->mcs.enabled ? "true" : "false",
 		s->sel->current_bucket, s->sel->current_mcs,
 		s->sel->in_failsafe ? "true" : "false", s->sel->recovery_streak,
@@ -3037,7 +3185,12 @@ static int append_mcs_json(char *buf, size_t cap, size_t pos,
 		(double)s->cfg->fec.bitrate_lead_s,
 		s->pending_drop_active ? "true" : "false",
 		s->pending_drop_target_mcs,
-		s->pending_drop_ms_remaining);
+		s->pending_drop_ms_remaining,
+		s->probe ? s->probe->total_records : 0u,
+		s->probe ? s->probe->parse_errors : 0u,
+		probe_age_s,
+		v2, pr ? pr->per_milli : -1,
+		pr ? pr->accounted : -1L, v2_age_s);
 	if (n < 0 || (size_t)n >= cap - pos) return -1;
 	return n;
 }
@@ -3975,8 +4128,18 @@ static void config_defaults(Config *c)
 	c->mcs.mcs_bucket_1 = 2;
 	c->mcs.mcs_bucket_2 = 3;
 	c->mcs.mcs_min = 0;
-	c->mcs.mcs_max = 11;
+	c->mcs.mcs_max = 5;   /* video caps at 5; rungs 6,7 reserved for probing */
 	c->mcs.start_low = false;
+	/* Boundary-probe control law (mode=1 opt-in; legacy bucket FSM is default
+	 * until the probe path is hardware-validated). */
+	c->mcs.mode              = 0;
+	c->mcs.mcs_start         = 0;     /* cold-start low, let the probe climb */
+	c->mcs.probe_clean_milli = 20;    /* <=2%  -> +2 clean -> promote        */
+	c->mcs.probe_fail_milli  = 100;   /* >=10% -> +2 fail  -> pre-empt demote*/
+	c->mcs.demote_per_milli  = 30;    /* >=3% live video PER -> reactive down*/
+	c->mcs.promote_dwell_s   = 0.5f;
+	c->mcs.probe_window_s    = 0.5f;
+	c->mcs.probe_stale_age_s = 1.5f;
 
 	/* CSA: off until --csa-iface is set. */
 	c->csa.enabled = false;
@@ -4564,6 +4727,8 @@ int main(int argc, char **argv)
 	selector_init(&sel);
 	Scorer scorer;
 	scorer_reset(&scorer);
+	ProbeState probe;
+	probe_state_init(&probe);
 	float    last_eff_rssi    = 0.0f;
 	float    last_smooth_rssi = 0.0f;
 	float    last_lost_ratio  = 0.0f;
@@ -4973,6 +5138,7 @@ int main(int argc, char **argv)
 				            : 0)
 				    : 0,
 				.wcmd = &wcmd_state,
+				.probe = &probe,
 			};
 			memcpy(snap.ant_avg, last_ant_avg, sizeof(snap.ant_avg));
 			for (int i = 0; i < API_MAX_CLIENTS; i++) {
@@ -5120,6 +5286,36 @@ int main(int argc, char **argv)
 					csa_link_alive(&csa_st, now_ms_csa);
 				}
 
+				/* Boundary-probe PER ingest. probe_log.py emits flat
+				 * records: {"type":"probe","mcs":M,"lost":L,
+				 * "accounted":A,...}. PER is derived from the integer
+				 * counters (no float parse). Phase 1: record only —
+				 * the control law does not consume these yet. */
+				if (strstr(dgram, "\"type\":\"probe\"")) {
+					long p_mcs = -1, p_acc = -1, p_lost = 0, p_ts = -1;
+					(void)json_get_int(dgram, "mcs",       &p_mcs);
+					(void)json_get_int(dgram, "accounted", &p_acc);
+					(void)json_get_int(dgram, "lost",      &p_lost);
+					(void)json_get_int(dgram, "ts_ms",     &p_ts);
+					if (p_mcs >= 0 && p_mcs < PROBE_MCS_MAX) {
+						ProbeRung *r = &probe.rung[p_mcs];
+						r->accounted = p_acc;
+						r->lost      = p_lost;
+						r->per_milli = (p_acc > 0)
+						    ? (int)((p_lost * 1000 + p_acc / 2) / p_acc)
+						    : -1;
+						r->last_us   = now_us();
+						r->ts_ms     = (p_ts >= 0) ? (uint64_t)p_ts : 0;
+						r->records++;
+						r->valid     = true;
+						probe.last_any_us = r->last_us;
+						probe.total_records++;
+					} else {
+						probe.parse_errors++;
+					}
+					continue;
+				}
+
 				if (!strstr(dgram, "\"type\":\"rx_ant\"")) continue;
 				if (!strstr(dgram, "\"ver\":1")) continue;
 
@@ -5171,8 +5367,10 @@ int main(int argc, char **argv)
 
 				int new_mcs = -1;
 				Selector sel_snap = sel;
-				SelectDecision sd =
-				    selector_update(&sel, &cfg, &score, last_rx_ant_us, &new_mcs);
+				SelectDecision sd = (cfg.mcs.mode == 1)
+				    ? selector_update_probe(&sel, &cfg, &score, &probe,
+				                            last_rx_ant_us, &new_mcs)
+				    : selector_update(&sel, &cfg, &score, last_rx_ant_us, &new_mcs);
 				if (sd == SD_NONE) {
 					/* Realign block — bucket→mcs mapping changed under us
 					 * (operator /set, or external party touched wfb_tx). */
