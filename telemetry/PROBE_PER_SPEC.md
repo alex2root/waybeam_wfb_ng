@@ -216,6 +216,41 @@ PR/spec** that must move three pieces in lockstep:
   RSSI-threshold "headroom" inference (§6).
 Fold probe-PER features into `wfb_link_score.py` and the Tier-1 retrain.
 
+## 8b. Mixed/parallel probing — VALIDATED on device (2026-06-10)
+
+Key realization (from reading live `wfb_rx -Y`): the stats key is `freq:mcs:bw`, so a
+**single `wfb_rx` already demultiplexes by MCS inside every `-l` window**. Sequential
+dwelling (swept single TX) is therefore the wrong model — it caps freshness at the
+sweep period and the shell feeder caps total rate at ~20 pps, so a compressed sweep
+trades PER resolution for freshness and loses both.
+
+**Parallel/mixed probing wins on both axes** and is the recommended production form:
+run **one continuous fixed-MCS `wfb_tx` per headroom rung** (distinct `radio_port =
+link_id + index`), each at a full 20 pps. Every rung then refreshes every 100 ms
+(`-l 100`) simultaneously — no sweep latency. Distinct radio_ports are required (same
+port + multiple TX corrupts the rx_ant seq/lost counting).
+
+Device soak (Star6E imx335 @192.168.1.13, GS = x86 + 2× RTL88x2, fixed distance):
+- **Tooling:** `probe_drone.sh <cur> <link> <pps> <secs> "5 6 7"` (3 concurrent TX) +
+  `probe_ground_parallel_soak.sh "5 6 7" 50` (3 RX, forward-port-safe `-u`, → `probe_log`
+  → `probe_bridge.py` → uplink `udp_in 6600` → `link_controller :5801`).
+- **Freshness:** `v2_age` dropped from **6–26 s (swept) → 0.04–0.6 s (parallel)**.
+- **Tuning that worked:** `mcs.probe_stale_age_s=1.0`, `probe_log --window-s 0.5`
+  (≈20 packets/rung accounted → ~5 % PER granularity), 20 pps/rung, rungs 5/6/7.
+  `--window-s 0.3` was too short (≈6 packets → frequent `accounted=0` → invalid PER).
+- **Control-law result:** with aggressive 1 s staleness + 10 Hz data, mode=1
+  **converged to `mcs_max` and held — `commit_count` froze, `changes_in_window=0`,
+  no oscillation, no failsafe; video downlink clean throughout.** The steady-state
+  de-risk passes.
+- **Residual:** at the ceiling, V+2 = MCS 7 occasionally reads invalid (`per_milli=-1`,
+  `accounted=0`) — real MCS-7 cliff marginality, not a tooling artifact. The law treats
+  invalid as **hold** (not fail), so it is safe.
+- **3 concurrent probe TX showed no driver stress** on the vehicle 8812eu (video link
+  `rx_ant_age` stayed ~0.02–0.1 s). The earlier "wide blast" stress was 4+ rungs.
+
+Note `probe_stale_age_s` default is 1.5 (tuned for slower data); fast parallel probing
+wants ~1.0. Phase 4 should set the production default to match the probe cadence.
+
 ## 9. Risks / open questions (validate before trusting)
 
 - **Reciprocity** — only an issue if someone shortcuts to uplink-only probing for
