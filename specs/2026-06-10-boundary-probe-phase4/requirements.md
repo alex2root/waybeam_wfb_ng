@@ -1,6 +1,7 @@
 # Boundary-Probe MCS Control — Phase 4 (Productionize) — Requirements
 
-Status: IMPLEMENTED 2026-06-10 (host-verified; device bring-up pending — §8)
+Status: IMPLEMENTED + DEVICE-VERIFIED 2026-06-10 (§8 complete except operator-gated
+induced-fade dynamic test)
 Date: 2026-06-10
 Branch: `feature/mcs-boundary-probe` (PR #58)
 Depends on: Phase 1+2 (`link_controller` boundary-probe law, merged in this PR);
@@ -232,18 +233,29 @@ Backward compatibility: every piece is gated (`wfbprobe`, tunnel `autostart`,
 
 ## 8. Verification / bring-up checklist
 
-- [ ] Host build of `link_controller` + `gs_supervisor` clean (`-Wall -Wextra`).
-- [ ] `wfbprobe=0`: `mcs.mode=1` holds at current MCS, no failsafe, no drift.
-- [ ] `wfbprobe=1`: probe `wfb_tx` up (link 50/p50), link_controller feeds it, probe
+- [x] Host build of `link_controller` + `gs_supervisor` clean (`-Wall -Wextra`).
+- [x] `wfbprobe=0`: `mcs.mode=1` holds at current MCS, no failsafe, no drift.
+      (Verified via the runtime-equivalent gate `mcs.probe_enabled=0`: feeder frozen,
+      law holds, no failsafe, re-enable recovers <1 s. Cold boot with `wfbprobe=0`
+      exercises the same `probe_on` gate plus no probe wfb_tx spawn.)
+- [x] `wfbprobe=1`: probe `wfb_tx` up (link 50/p50), link_controller feeds it, probe
       records arrive at `:5801` (`/mcs/status` `probe.records` climbing, `parse_errors=0`).
-- [ ] `v2_age` < 1 s continuously at steady state; `v2_mcs == current_mcs + 2`.
-- [ ] Video MCS commit retunes probe within one tick; `v2_mcs` tracks.
-- [ ] Reactive demote 5→4 retunes probe 7→6 and does NOT immediately re-promote on a
-      stale rung[6] (the §5.1 invariant).
-- [ ] gs_supervisor rejects/warns a non-video tunnel forwarding to 5600.
-- [ ] CSA hop: probe survives, records resume after hop.
-- [ ] Steady-state soak (fixed distance): converges to ceiling, holds, no oscillation,
+- [x] `v2_age` < 1 s continuously at steady state; `v2_mcs == current_mcs + 2`.
+      (Observed 0.04–0.5 s at 20 pps; 0.06–0.25 s typical after the 40 pps tuning.)
+- [x] Video MCS commit retunes probe within one tick; `v2_mcs` tracks.
+      (Live log: retune fires before the deferred video SET_RADIO commit.)
+- [x] Reactive demote 5→4 retunes probe 7→6 and does NOT immediately re-promote on a
+      stale rung[6] (the §5.1 invariant). (Gate host-proven; live demote→retune in 6 ms.)
+- [x] gs_supervisor rejects/warns a non-video tunnel forwarding to 5600.
+- [x] CSA hop: probe survives, records resume after hop. (2026-06-10, live 161→157→161
+      round trip: vehicle COMMITTED 118 ms after switch; the hop's transient loss caused
+      exactly one reactive demote 5→4 with probe retune 7→6 in 6 ms, then a clean rung
+      read re-promoted to 5 within 0.6 s. GS probe tunnel `stale_dropped=0`, no
+      failsafe, `retune_fails=0` across both hops.)
+- [x] Steady-state soak (fixed distance): converges to ceiling, holds, no oscillation,
       video clean (re-confirm the Phase-pre result through the production path).
+      (Post ceiling-bounce fix — 40 pps / `probe_fail_milli=200`: 2-minute window,
+      0 demotes, held MCS 5 with `v2_acc=20, v2_per=0`.)
 - [ ] Induced-fade dynamic test (operator): clean fast demote→re-promote, no flap at the
       boundary. (Deferred from the steady-state soak.)
 
