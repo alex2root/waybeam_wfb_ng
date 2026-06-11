@@ -1,7 +1,8 @@
 # Unified MCS law — PER probe primary + RSSI guard-rails
 
 Status: IMPLEMENTED 2026-06-10 (follows directly from the Phase 4 boundary-probe
-bring-up; legacy RSSI-bucket FSM removed in the same change)
+bring-up; legacy RSSI-bucket FSM removed in the same change).
+Hardening batch from the 2026-06-11 code review applied — see §8.
 
 ## 1. Context
 
@@ -26,16 +27,22 @@ Evaluated once per video rx_ant datagram in `selector_update()`
 | 1 | Reactive demote | smoothed video PER ≥ `demote_per_milli` (30‰) | real damage signal, fastest |
 | 2 | RSSI floor demote | smoothed RSSI ≤ `rssi_floor_dbm` (−85) | deep-fade backstop; works when the probe stream died with the fade |
 | 3 | RSSI fade demote | slope ≤ −`rssi_fade_db_per_s` (10) AND RSSI ≤ `rssi_fade_arm_dbm` (−65) | pre-emptive on fast collapse, before PER damage; fades at strong signal ignored |
-| 4 | Probe V+2 | fresh + post-gate rung[V+2]: PER ≥ `probe_fail_milli` (200‰) → demote; PER ≤ `probe_clean_milli` (20‰) → promote +1 after `promote_dwell_s` | the Phase 4 law, unchanged |
+| 4 | Probe V+2 | fresh + post-gate rung[V+2]: PER ≥ `probe_fail_milli` (200‰) → demote; PER ≤ `probe_clean_milli` (20‰) → promote +1 after `promote_dwell_s`. **Fail branch is evaluated first** so an inverted config (clean ≥ fail, warned) can only demote/hold, never promote on a failing rung | the Phase 4 law, unchanged |
 | 5 | Hold | — | stale probe / mid-band PER |
 
 - **Promote guard**: promotes are blocked while rule 3 is active, or while
   smoothed RSSI ≤ `rssi_floor_dbm` + 3 dB (hysteresis so promotes don't resume
   on the knife-edge).
 - **RSSI slope**: per-sample derivative of the smoothed RSSI series, EWMA'd
-  with fixed α=0.3 (~0.3 s response at the 10 Hz rx_ant rate; no extra knob).
-  dt clamped to [10 ms, 2 s]; longer stats gaps decay the slope instead of
-  producing a bogus spike.
+  with fixed α=0.3 (no extra knob). **Latency honesty**: this is two cascaded
+  first-order filters (rssi_ewma + slope ewma, each τ≈0.28 s at 10 Hz) — a
+  real −12 dB/s fade crosses the default −10 dB/s threshold only after
+  ~0.9 s (~11 dB of drop). Rule 3 is a *backstop* that genuinely pre-empts
+  only fast fades (≳20 dB/s); near-threshold fades are usually caught by
+  rule 1 (loss EWMA α=0.5, ~0.2 s) or the floor first.
+  dt handling: < 10 ms (burst-drained datagrams after an event-loop stall)
+  → sample skipped entirely, baseline untouched; > 2 s → slope reset to 0
+  (a fade rate measured before a blackout carries no information about now).
 - **Failsafe** (watchdog, unchanged): no rx_ant for `failsafe_timeout_s` →
   commit `mcs_min`; clears on the next datagram.
 
@@ -76,8 +83,18 @@ Behavioral side effects of the unification:
 | `mcs.rssi_fade_db_per_s` | 10.0 (0 = fade rule off) | `--rssi-fade` |
 | `mcs.rssi_fade_arm_dbm` | −65.0 | `--rssi-fade-arm` |
 
-Validation warning when `rssi_fade_arm_dbm <= rssi_floor_dbm` (fade rule could
-never fire before the floor rule).
+CLI values are strict-parsed with the same ranges as the `/set` path
+([−120,0] / [0,60] / [−120,0]); a malformed or out-of-range value is a
+startup error (a sign typo like `--rssi-floor 85` would otherwise pin
+`floor_hit` true and demote to `mcs_min` forever).
+
+Validation warnings (startup + every `/set`):
+- `rssi_fade_arm_dbm <= rssi_floor_dbm` (fade rule could never fire before
+  the floor rule)
+- `probe_clean_milli >= probe_fail_milli` (clean band empty — probe can only
+  demote or hold)
+- `probe_fail_milli <= demote_per_milli` (probe pre-empt cannot fire before
+  the reactive rule)
 
 Defaults are bench-safe (bench RSSI ≈ −24 dBm: neither rule arms) and chosen
 from typical wfb-ng link budgets; **field-tune `rssi_floor_dbm` against the
@@ -96,6 +113,50 @@ real MCS0 sensitivity point** during range testing.
 ## 7. Deferred
 
 - Field calibration of floor/fade defaults at real range (bench cannot fade).
+  Note from review: at the default 10 dB/s threshold, rule 3 mostly duplicates
+  rules 1/2 (see §2 latency note) — calibration should decide whether to keep
+  it, raise the threshold, or derive slope from raw RSSI for real pre-emption.
 - Induced-fade dynamic test (operator at bench) — inherited from Phase 4 §8.
-- `SD_RECOVERED` decision code is now unreachable (legacy unfreeze emitted it);
-  kept in the enum for log-string stability, prune on next touch.
+- ~~`SD_RECOVERED` decision code is now unreachable~~ — pruned in the §8 batch.
+
+## 8. Hardening batch (2026-06-11 code review)
+
+Full review: 3 independent passes (embedded-C safety, control-law semantics,
+integration). Core law verified faithful to §2; all findings were in the
+*inputs* to the guard-rails plus one inherited cache desync. Applied:
+
+- **Slope estimator**: burst-drained datagrams (dt < 10 ms, up to 32 queued
+  after an event-loop stall) no longer decay the slope or move the baseline;
+  gaps > 2 s reset the slope to 0 instead of one decay step (a pre-outage
+  −20 dB/s survived as −14 and could spuriously trip the fade rule on
+  recovery).
+- **NaN/inf rejected** in `parse_strict_double` — `/set?...=nan` previously
+  passed the range check (NaN compares false) and silently disarmed the
+  guard comparisons while corrupting /status JSON.
+- **CLI strict parse + range** for `--rssi-floor/--rssi-fade/--rssi-fade-arm`
+  (see §5).
+- **Rule-4 fail branch evaluated first** (see §2 table) + two new validation
+  warnings (see §5).
+- **Live `/set` of `mcs_min`/`mcs_max` re-clamps** the committed MCS on the
+  next watchdog tick (≤ failsafe_timeout_s/4); previously a lowered `mcs_max`
+  at ceiling hold was never applied until real link damage demoted. The clamp
+  commit goes through the normal ordered-drop path (probe retune still leads
+  the video SET).
+- **Guard flags cleared on failsafe entry** — they are refreshed per-datagram
+  and froze at their last value on a dead link, lying in /status.
+- **/status renames** (consumers: WebUI updated in the same commit):
+  `score.lost_ratio/recov_ratio/diversity_ratio` →
+  `smoothed_lost_ratio/smoothed_recov_ratio/smoothed_diversity_ratio` (the
+  values were always the EWMA the law evaluates; named honestly now).
+  New `mcs.probe.v2_gated` — true when the V+2 rung looks fresh but predates
+  the §5.1 commit gate (the law is refusing it).
+- `SD_RECOVERED` pruned; stale "mode=1"/"selector_commit_mcs" comments fixed.
+
+Verified: host E2E extended to 24 checks (A–E: original 17 + nan/inf
+rejection, live mcs_max re-clamp + restore climb, inverted-threshold
+no-promote + recovery, new /status fields), all PASS; 76 wire tests; host +
+ARM cross-build clean.
+
+Known remaining (separate commit): the WCMD radio write-through desync —
+`radio_body` is a self-write cache, so operator WCMD radio writes bypass the
+realign/probe-mirror (review finding B1).

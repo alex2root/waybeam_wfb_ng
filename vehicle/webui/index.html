@@ -433,12 +433,12 @@ function renderStatus(s) {
     $("#c-rssi-sub").textContent = sub;
   }
 
-  // Loss
-  if ("lost_ratio" in score) {
-    const lp = score.lost_ratio * 100;
+  // Loss (smoothed/EWMA — the values the law evaluates)
+  if ("smoothed_lost_ratio" in score) {
+    const lp = score.smoothed_lost_ratio * 100;
     $("#c-loss").textContent = lp.toFixed(2) + "%";
     $("#c-loss").className = "v " + (lp > 5 ? "bad" : lp > 0.5 ? "warn" : "ok");
-    $("#c-loss-sub").textContent = "fec_recov " + ((score.recov_ratio||0)*100).toFixed(1) + "%";
+    $("#c-loss-sub").textContent = "fec_recov " + ((score.smoothed_recov_ratio||0)*100).toFixed(1) + "%";
   }
 
   // Diversity — redundant-copies-per-unique-fragment (count_p_diversity /
@@ -446,8 +446,8 @@ function renderStatus(s) {
   // overlapping = (N-1) × 100%.  Distinct from fec_recov: high diversity
   // means a second/third adapter routinely saved us without needing parity.
   // adapter_count = -1 → older RX without the patch.
-  if ("diversity_ratio" in score) {
-    const dv = (score.diversity_ratio || 0) * 100;
+  if ("smoothed_diversity_ratio" in score) {
+    const dv = (score.smoothed_diversity_ratio || 0) * 100;
     const ac = ("adapter_count" in score) ? score.adapter_count : -1;
     $("#c-div").textContent = dv.toFixed(1) + "%";
     /* Colour: ok when ≥1 redundant copy on average; warn for partial
@@ -509,6 +509,7 @@ function renderStatus(s) {
     probe_tuned_mcs: pb.tuned_mcs,
     v2_per_milli: pb.v2_per_milli,
     v2_age_s: (pb.v2_age_s >= 0) ? pb.v2_age_s.toFixed(2) : "—",
+    v2_gated: !!pb.v2_gated,
     probe_records: pb.records,
     retune_fails: pb.retune_fails,
     rssi_slope: (score.rssi_slope_db_s != null) ? score.rssi_slope_db_s.toFixed(1) : "—",
