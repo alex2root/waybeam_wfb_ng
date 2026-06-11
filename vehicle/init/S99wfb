@@ -45,11 +45,18 @@ PID_TX="/var/run/wfb_tx.pid"
 PID_RX="/var/run/wfb_rx.pid"
 PID_LC="/var/run/link_controller.pid"
 PID_PTX="/var/run/wfb_probe_tx.pid"
+PID_WALK="/var/run/walkout_logger.pid"
 LOG="/tmp/wfb.log"
+# Walkout telemetry logger: mirrors the wfb log + samples /status at 1 Hz
+# to the SD card (sessions under /mnt/mmcblk0p1/walkout/, newest 10 kept).
+# Default ON; it exits silently when no SD card is mounted, so it is safe
+# to leave enabled. Disable entirely: fw_setenv wfblog 0.
+WALKOUT_BIN="/usr/sbin/walkout_logger.sh"
 
 fw_get() { fw_printenv -n "$1" 2>/dev/null || echo "$2"; }
 is_enabled() { [ "$(fw_get wfbmode 0)" = "1" ]; }
 probe_enabled() { [ "$(fw_get wfbprobe 0)" = "1" ]; }
+walkout_enabled() { [ "$(fw_get wfblog 1)" = "1" ] && [ -x "$WALKOUT_BIN" ]; }
 log() { echo "[wfb] $*" | tee -a "$LOG"; }
 
 start_wfb() {
@@ -120,12 +127,18 @@ start_wfb() {
         >> "$LOG" 2>&1 &
     echo $! > "$PID_LC"
 
-    log "started (tx=$(cat $PID_TX) rx=$(cat $PID_RX) lc=$(cat $PID_LC)$(probe_enabled && echo " ptx=$(cat $PID_PTX)"))"
+    # Walkout telemetry logger (SD card only; see WALKOUT_BIN above).
+    if walkout_enabled; then
+        "$WALKOUT_BIN" >> "$LOG" 2>&1 &
+        echo $! > "$PID_WALK"
+    fi
+
+    log "started (tx=$(cat $PID_TX) rx=$(cat $PID_RX) lc=$(cat $PID_LC)$(probe_enabled && echo " ptx=$(cat $PID_PTX)")$(walkout_enabled && echo " walk=$(cat $PID_WALK)"))"
 }
 
 stop_wfb() {
     log "stopping"
-    for f in "$PID_LC" "$PID_PTX" "$PID_RX" "$PID_TX"; do
+    for f in "$PID_WALK" "$PID_LC" "$PID_PTX" "$PID_RX" "$PID_TX"; do
         [ -f "$f" ] && { kill "$(cat $f)" 2>/dev/null; rm -f "$f"; }
     done
     sleep 0.5
@@ -148,6 +161,14 @@ status_wfb() {
         kill -0 "$ppid" 2>/dev/null \
             && echo "  probe wfb_tx: $ppid" \
             || echo "  probe wfb_tx: stale pidfile ($ppid)"
+    fi
+    if [ -f "$PID_WALK" ]; then
+        wpid=$(cat "$PID_WALK")
+        kill -0 "$wpid" 2>/dev/null \
+            && echo "  walkout logger: $wpid ($(ls -1d /mnt/mmcblk0p1/walkout/*/ 2>/dev/null | sort | tail -1))" \
+            || echo "  walkout logger: stale pidfile ($wpid)"
+    else
+        echo "  walkout logger: off (wfblog env: $(fw_get wfblog 1), SD: $(grep -q ' /mnt/mmcblk0p1 ' /proc/mounts && echo present || echo absent))"
     fi
     echo "wlan0:"
     iw dev wlan0 info 2>/dev/null | grep -E "type|channel|txpower" | sed 's/^/  /'
