@@ -157,6 +157,34 @@ rejection, live mcs_max re-clamp + restore climb, inverted-threshold
 no-promote + recovery, new /status fields), all PASS; 76 wire tests; host +
 ARM cross-build clean.
 
-Known remaining (separate commit): the WCMD radio write-through desync —
-`radio_body` is a self-write cache, so operator WCMD radio writes bypass the
-realign/probe-mirror (review finding B1).
+## 9. WCMD radio write-through (review finding B1, separate commit)
+
+`radio_body` was a self-write cache: operator WCMD radio writes
+(`WFB_MCS`/`WFB_BANDWIDTH`/`WFB_LDPC`/`WFB_STBC`/`WFB_SHORT_GI`) went
+GET→mutate→SET straight to wfb_tx without updating the main loop's cache or
+the selector. Consequences (all fixed): the realign never saw the change (it
+compares selector vs *cache*, not vs wfb_tx); the probe PHY mirror kept the
+old bandwidth, so probe PER measured the wrong PHY; and the next selector
+commit rebuilt its SET body from the stale cache, silently reverting the
+operator's write.
+
+Fix: a successful WCMD radio SET reports the applied body via
+`WcmdState.radio_written{,_body}`; the dispatch site in the main loop adopts
+it:
+
+- `radio_body` ← applied body (non-MCS PHY fields now STICK across future
+  adaptive commits).
+- MCS key: adopted into the selector via `selector_commit` (clamped to
+  `[mcs_min,mcs_max]`; out-of-clamp writes get pulled back by the realign on
+  the next datagram). The law continues from the operator's rung — manual MCS
+  only sticks with `WCMD_KEY_MCS_ENABLED=0`, as before.
+- If a deferred MCS-down is in flight, its pending SET body is patched with
+  the operator's PHY fields but keeps the adaptive target MCS (adaptive law
+  wins the MCS field mid-drop).
+- `radio_apply_observation(from_self=true)` arms the FEC settle/boost windows
+  so the budget follows the new PHY.
+
+Verified: harness Phase F (F1 probe mirror follows WCMD bandwidth same tick;
+F2 adaptive demote commit preserves operator bw=40 — pre-fix it reverted to
+20; F3 selector adopts WCMD MCS; F4 probe retunes to adopted V+2; F5 law
+re-promotes from the adopted rung). Full harness 29/29.

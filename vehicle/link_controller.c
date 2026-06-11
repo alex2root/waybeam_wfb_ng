@@ -1518,6 +1518,15 @@ typedef struct {
 	uint8_t  last_key;
 	int32_t  last_value;
 	int      last_http_status;
+	/* Radio write-through: set when a WFB_* radio key was successfully
+	 * applied to wfb_tx this dispatch. The main loop adopts the body into
+	 * its radio_body cache (and the selector, for the MCS key) — without
+	 * this, the cache desyncs and (a) the realign never sees the operator
+	 * change, (b) the probe PHY mirror keeps the old bandwidth, and (c)
+	 * the next selector commit rebuilds its SET from the stale cache and
+	 * silently reverts the operator's write. */
+	bool      radio_written;
+	RadioBody radio_written_body;
 } WcmdState;
 
 /* Build the venc /api/v1 path for a given (key, value). path must be
@@ -1815,11 +1824,14 @@ static int wcmd_dispatch(Config *cfg, const WcmdReq *req,
 
 	/* wfb_tx control keys go to a local wfb_cmd round-trip rather than
 	 * the venc HTTP surface.  Read current radio/fec state, mutate just
-	 * the requested field, write back via SET_RADIO / SET_FEC.  Caveat:
-	 * link_controller's adaptive FEC and MCS subsystems will overwrite
-	 * these on their next tick — toggle WCMD_KEY_FEC_ENABLED=0 /
-	 * WCMD_KEY_MCS_ENABLED=0 first if you want manual control to
-	 * stick. */
+	 * the requested field, write back via SET_RADIO / SET_FEC.
+	 * Radio keys write through to the main loop's radio_body cache (see
+	 * WcmdState.radio_written): non-MCS PHY fields (bandwidth/gi/stbc/
+	 * ldpc) STICK — future commit bodies carry them. The MCS key is
+	 * adopted into the selector as the new rung, but the adaptive law
+	 * keeps moving it — toggle WCMD_KEY_MCS_ENABLED=0 first if you want
+	 * manual MCS to stick. FEC k/n is still overwritten by the FEC
+	 * subsystem on its next commit (WCMD_KEY_FEC_ENABLED=0 to hold). */
 	if (key >= WCMD_KEY_WFB_FEC_K && key <= WCMD_KEY_WFB_SHORT_GI) {
 		if (cfg->dry_run) {
 			resp->status = WCMD_STATUS_OK;
@@ -1870,6 +1882,10 @@ static int wcmd_dispatch(Config *cfg, const WcmdReq *req,
 			default: break;
 			}
 			rc = wfb_set_radio(cfg, &r);
+			if (rc == 0) {
+				st->radio_written      = true;
+				st->radio_written_body = r;
+			}
 		}
 		if (rc != 0) {
 			resp->status = WCMD_STATUS_HTTP_ERROR;
@@ -5383,6 +5399,55 @@ int main(int argc, char **argv)
 						(void)sendto(rx_ant_fd, &resp, sizeof(resp), 0,
 						             (const struct sockaddr *)&peer,
 						             sizeof(peer));
+						/* Operator radio write-through: adopt the body
+						 * the dispatch just SET on wfb_tx into our cache
+						 * so the realign / probe PHY mirror / future
+						 * commit bodies all see it (instead of silently
+						 * reverting it from a stale cache). */
+						if (wcmd_state.radio_written) {
+							wcmd_state.radio_written = false;
+							RadioBody wb = wcmd_state.radio_written_body;
+							radio_body = wb;
+							radio_body_valid = true;
+							if (pending_drop.active) {
+								/* A deferred MCS-down is in flight: keep
+								 * its target MCS (adaptive law wins the
+								 * MCS field) but carry the operator's
+								 * other PHY fields into the pending SET
+								 * so they survive the deferred write. */
+								uint8_t m = pending_drop.pending_radio.mcs_index;
+								pending_drop.pending_radio = wb;
+								pending_drop.pending_radio.mcs_index = m;
+							}
+							bool covered_by_pending =
+							    pending_drop.active &&
+							    pending_drop.target_mcs == sel.current_mcs;
+							if (cfg.mcs.enabled && sel.current_mcs >= 0 &&
+							    !covered_by_pending &&
+							    (int)wb.mcs_index != sel.current_mcs) {
+								/* MCS key: adopt into the selector — the
+								 * law continues from the operator's rung.
+								 * selector_commit clamps to [mcs_min,
+								 * mcs_max]; if the operator wrote outside
+								 * the clamp, the realign pulls wfb_tx
+								 * back on the next datagram. */
+								int adopted = -1;
+								SelectDecision dir =
+								    (int)wb.mcs_index > sel.current_mcs
+								    ? SD_UP : SD_DOWN;
+								(void)selector_commit(&sel, &cfg,
+								    (int)wb.mcs_index, now_us(), dir,
+								    &adopted);
+								last_emit_mcs = adopted;
+								LOG_MCS("wcmd: operator radio write adopted (mcs=%d, sel=%d)",
+								    wb.mcs_index, adopted);
+							}
+							radio_apply_observation(&radio, &fec_ctrl,
+							    &cfg, wb.mcs_index, wb.bandwidth,
+							    wb.short_gi, wb.stbc, wb.ldpc,
+							    wb.vht_mode, wb.vht_nss,
+							    now_us(), true);
+						}
 						if (cfg.verbose >= 1) {
 							char ip[INET_ADDRSTRLEN];
 							inet_ntop(AF_INET, &peer.sin_addr, ip,
