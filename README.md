@@ -200,7 +200,12 @@ Sizing: `k = ceil(EWMA_size / MTU) × headroom`, with headroom learned
 from observed I/P ratio (1.05–1.40).  I-frames that exceed `k×MTU` span
 multiple FEC blocks, but the patched `wfb_tx` honours the RTP M-bit and
 closes each frame's final block on the boundary, so single-block loss
-never contaminates adjacent frames.
+never contaminates adjacent frames.  The close has two modes: the default
+**gate** (closes a block only once it is ≥ k/2 full, to avoid the on-air
+packet-rate burst a naive per-frame close causes) and opt-in
+**`--peek-short-tail`** (proportional parity + no on-air padding, which
+restores closing on *every* frame at ~⅓ less overhead).  See
+[`docs/design/peek-proportional-parity.md`](docs/design/peek-proportional-parity.md).
 
 ## WCMD redundancy
 

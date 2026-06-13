@@ -24,9 +24,13 @@ mcs_selector) is the historical predecessor.  It's no longer deployed.
   - ground: gs_supervisor → uplink wfb_tx (WCMD on udp_in_port) → vehicle link_controller
 - **CSA**: ground arms, sends 5 csa_commit JSON frames @ 20 ms cadence
   → vehicle csa_feed schedules iw set channel → both sides hop in lockstep
-- **Stateless FEC sizing**: k from EWMA × bounded headroom; M-bit in
-  wfb_tx aligns every frame's final block, so block loss never
-  contaminates adjacent frames
+- **Stateless FEC sizing**: k from EWMA × bounded headroom; the peek
+  per-frame FEC close (RTP M-bit) aligns each frame's final block so
+  block loss doesn't contaminate adjacent frames. Two close modes: the
+  default **gate** (only closes blocks ≥ k/2 full — full per-frame
+  isolation traded for airtime) and opt-in **`--peek-short-tail`**
+  (proportional parity, no on-air padding — restores per-frame closing
+  cheaply). See `docs/design/peek-proportional-parity.md`.
 
 ## Repository layout
 
@@ -106,8 +110,10 @@ make test-archive
 
 Asymmetric gating — fast increase, slow decrease (mirror of TCP AIMD):
 - **Sizing**: k from EWMA × bounded headroom (1.05–1.40). I-frames
-  exceeding k×MTU span multiple blocks; M-bit in wfb_tx closes each
-  frame's final block cleanly.
+  exceeding k×MTU span multiple blocks; the peek per-frame FEC close
+  (M-bit) closes each frame's final block. Close cost/mode: see the
+  peek `--peek-short-tail` note in the Architecture section above and
+  `docs/design/peek-proportional-parity.md`.
 - **Increase**: hysteresis=1, cooldown=0.1 s
 - **Decrease**: hysteresis=3, cooldown=2.0 s
 - **Oscillation detector**: >4 updates in 5 s → decrease cooldown × 3

@@ -348,6 +348,17 @@ Both sides must match or packets are silently dropped. The
   `(block_idx, fragment_idx)` nonce, so exact replays are still
   rejected.
 
+> **Reserved nonce bit (SHORT_TAIL, PR #64).** The 64-bit `data_nonce` is
+> `(block_idx << 8) | fragment_idx` with `block_idx ≤ 2^55−1`, so bit 63 is
+> always 0 on the wire. `--peek-short-tail` (peek proportional-parity close)
+> uses it as `WFB_NONCE_SHORT_TAIL`: set on a single boundary marker fragment to
+> tell the RX to synthesize the block's `[j+1, k)` tail locally instead of
+> receiving it on-air. The bit is part of the AEAD AAD (authenticated in encrypt
+> mode); the RX masks it off before deriving `block_idx`. In `-x` plaintext mode
+> the RX validates the marker (FEC_ONLY, size 0, `1 ≤ j < fec_k`) before acting.
+> Full spec: `docs/design/peek-proportional-parity.md`. Default off — only set
+> when both ends run a SHORT_TAIL-aware build.
+
 ### What `-x` removes
 
 - **Per-fragment authentication.** Anyone on the channel can inject
