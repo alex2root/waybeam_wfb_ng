@@ -9,6 +9,19 @@ design rationale and the canonical match/action vocabulary; read it first.
 protocol, and FEC-close mechanics away from stock `svpcom/wfb-ng`. Where the
 spec and this repo disagree, **this document wins** for implementation.
 
+> **Implementation status (this branch).** Phase 1 is implemented as
+> `wfb-ng/peek.patch` (applies on top of `shm-input.patch`; grounded in the
+> real cloned tree at `svpcom/wfb-ng` `af6ba85`). It adds `src/peek.{hpp,cpp}`
+> (the classification engine), `src/test_peek.cpp` (26 host checks, all green),
+> the `tx.cpp` PROTECT/DROP/FEC-close hooks on **both** the SHM and UDP paths,
+> the per-level radiotap cache (rebuilt on `CMD_SET_RADIO`), and
+> `CMD_SET_PEEK`/`CMD_GET_PEEK` + `wfb_tx_cmd peek` verbs. The three
+> `wfb-ng/build-*.sh` scripts apply `peek.patch` and compile/link `peek.o`.
+> Verified on the host: engine unit test passes; `wfb_tx` + `wfb_tx_cmd`
+> compile (`-Wall`) and **link** clean with `peek.o`. Not yet done: on-target
+> bench/loopback (§10.2-10.6), the venc-repo `build_wfb_tx.sh` wiring, peek
+> counters in the `-Y` JSON, and the wfb-ng SHA pin (§7).
+
 The design intent in `CLAUDE.md` — *"M-bit in wfb_tx aligns every frame's
 final block, so block loss never contaminates adjacent frames"* — describes a
 mechanism that **was implemented at one point and then removed**; the

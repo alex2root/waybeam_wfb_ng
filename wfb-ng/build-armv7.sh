@@ -217,6 +217,28 @@ else
     exit 1
 fi
 
+# ── Step 4b: Apply peek.patch (NAL-aware link protection) ────────────
+# Applies on top of shm-input.patch; adds src/peek.{hpp,cpp} + the wfb_tx
+# PROTECT/DROP/FEC-close hooks and CMD_SET_PEEK/CMD_GET_PEEK.
+
+if git apply --reverse --check "$SCRIPT_DIR/peek.patch" 2>/dev/null; then
+    echo "=== peek.patch already applied ==="
+elif git apply --check "$SCRIPT_DIR/peek.patch" 2>/dev/null; then
+    echo "=== Applying peek.patch ==="
+    git apply "$SCRIPT_DIR/peek.patch"
+    echo "Patch applied successfully."
+else
+    echo "ERROR: peek.patch does not apply on top of shm-input.patch."
+    echo "Run ./build_wfb_tx.sh --clean and rebuild."
+    exit 1
+fi
+
+# Host unit test for the peek engine (pure host code; quick correctness gate).
+if command -v g++ >/dev/null 2>&1; then
+    echo "=== Running host peek unit test ==="
+    g++ -std=gnu++11 -Isrc -o /tmp/test_peek src/test_peek.cpp src/peek.cpp && /tmp/test_peek
+fi
+
 # ── Step 5: Build wfb_tx + wfb_keygen ───────────────────────────────
 
 echo "=== Building wfb_tx ==="
@@ -258,6 +280,9 @@ rm -f src/*.o
 echo "  Compiling tx.cpp..."
 $CROSS_CXX $WFB_CFLAGS -std=gnu++11 -c -o src/tx.o src/tx.cpp
 
+echo "  Compiling peek.cpp..."
+$CROSS_CXX $WFB_CFLAGS -std=gnu++11 -c -o src/peek.o src/peek.cpp
+
 echo "  Compiling zfex.c..."
 $CROSS_CC $WFB_CFLAGS -std=gnu99 -c -o src/zfex.o src/zfex.c
 
@@ -268,7 +293,7 @@ echo "  Compiling venc_ring.c..."
 $CROSS_CC $WFB_CFLAGS -std=gnu99 -c -o src/venc_ring.o src/venc_ring.c
 
 echo "  Linking wfb_tx..."
-$CROSS_CXX -o wfb_tx src/tx.o src/zfex.o src/wifibroadcast.o src/venc_ring.o $WFB_LDFLAGS
+$CROSS_CXX -o wfb_tx src/tx.o src/peek.o src/zfex.o src/wifibroadcast.o src/venc_ring.o $WFB_LDFLAGS
 
 echo "  Stripping..."
 $CROSS_STRIP wfb_tx

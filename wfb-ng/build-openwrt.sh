@@ -100,6 +100,17 @@ else
     exit 1
 fi
 
+# peek.patch (NAL-aware link protection) on top of shm-input.patch. Idempotent.
+if git -C "$WFB_DIR" apply --reverse --check "$SCRIPT_DIR/peek.patch" 2>/dev/null; then
+    echo "=== peek.patch already applied ==="
+elif git -C "$WFB_DIR" apply --check "$SCRIPT_DIR/peek.patch" 2>/dev/null; then
+    echo "=== Applying peek.patch ==="
+    git -C "$WFB_DIR" apply "$SCRIPT_DIR/peek.patch"
+else
+    echo "ERROR: peek.patch does not apply on top of shm-input.patch." >&2
+    exit 1
+fi
+
 # venc_ring.{c,h} are needed at compile time even though CPE510 won't run the
 # SHM path. Copying them keeps the source set identical to the armv7l build.
 cp "$WFB_NG_ROOT/include/venc_ring.h" "$WFB_DIR/src/venc_ring.h"
@@ -150,9 +161,10 @@ $CROSS_CC  $CFLAGS_BASE -std=gnu99   -c -o "$OBJDIR/radiotap.o"      src/radiota
 # ── wfb_tx ───────────────────────────────────────────────────────────
 echo "=== Building wfb_tx ==="
 $CROSS_CXX $CFLAGS_BASE -std=gnu++11 -c -o "$OBJDIR/tx.o"        src/tx.cpp
+$CROSS_CXX $CFLAGS_BASE -std=gnu++11 -c -o "$OBJDIR/peek.o"      src/peek.cpp
 $CROSS_CC  $CFLAGS_BASE -std=gnu99   -c -o "$OBJDIR/venc_ring.o" src/venc_ring.c
 $CROSS_CXX -o "$BUILD_DIR/wfb_tx" \
-    "$OBJDIR/tx.o" "$OBJDIR/zfex.o" "$OBJDIR/wifibroadcast.o" "$OBJDIR/venc_ring.o" \
+    "$OBJDIR/tx.o" "$OBJDIR/peek.o" "$OBJDIR/zfex.o" "$OBJDIR/wifibroadcast.o" "$OBJDIR/venc_ring.o" \
     $LDFLAGS_BASE -lsodium -lrt $CXX_STATIC_EXTRA
 $CROSS_STRIP "$BUILD_DIR/wfb_tx"
 
