@@ -604,7 +604,7 @@ index 0000000..38c2c21
 +    return g_fail ? 1 : 0;
 +}
 diff --git a/src/tx.cpp b/src/tx.cpp
-index 2dc86ea..63fb79a 100644
+index 2dc86ea..9da4d8c 100644
 --- a/src/tx.cpp
 +++ b/src/tx.cpp
 @@ -22,6 +22,7 @@
@@ -862,7 +862,7 @@ index 2dc86ea..63fb79a 100644
  
              log_send_ts = cur_ts + log_interval - ((cur_ts - log_send_ts) % log_interval);
          }
-@@ -1227,6 +1340,45 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -1227,6 +1340,56 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                  }
                  break;
  
@@ -896,10 +896,21 @@ index 2dc86ea..63fb79a 100644
 +                        continue;
 +                    }
 +
++                    // Largest PROTECT depth in the action table (parity/floor hint).
++                    uint8_t max_delta = 0;
++                    for (uint8_t i = 0; i < g_peek_cfg.n_rules; i++)
++                    {
++                        if (g_peek_cfg.rules[i].action == PEEK_ACT_PROTECT &&
++                            g_peek_cfg.rules[i].mcs_delta > max_delta)
++                            max_delta = g_peek_cfg.rules[i].mcs_delta;
++                    }
++
 +                    resp.u.cmd_get_peek.enabled      = g_peek_cfg.enabled ? 1 : 0;
 +                    resp.u.cmd_get_peek.drop_enabled = g_peek_cfg.drop_enabled ? 1 : 0;
 +                    resp.u.cmd_get_peek.n_rules      = g_peek_cfg.n_rules;
 +                    resp.u.cmd_get_peek.n_sig_rules  = g_peek_cfg.n_sig_rules;
++                    resp.u.cmd_get_peek.base_mcs     = t->get_radiotap_header().mcs_index;
++                    resp.u.cmd_get_peek.max_delta    = max_delta;
 +
 +                    sendto(fd, &resp, offsetof(cmd_resp_t, u) + sizeof(resp.u.cmd_get_peek), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
 +                }
@@ -908,7 +919,7 @@ index 2dc86ea..63fb79a 100644
                  default:
                  {
                      resp.rc = htonl(ENOTSUP);
-@@ -1346,7 +1498,8 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -1346,7 +1509,8 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                      session_key_announce_ts = cur_ts + SESSION_KEY_ANNOUNCE_MSEC;
                  }
  
@@ -918,7 +929,7 @@ index 2dc86ea..63fb79a 100644
  
                  if (cur_ts >= log_send_ts)
                  {
-@@ -1482,7 +1635,8 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -1482,7 +1646,8 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                          session_key_announce_ts = cur_ts + SESSION_KEY_ANNOUNCE_MSEC;
                      }
  
@@ -928,7 +939,7 @@ index 2dc86ea..63fb79a 100644
  
                      if (cur_ts >= log_send_ts)  // log timeout expired
                      {
-@@ -2161,8 +2315,37 @@ int main(int argc, char * const *argv)
+@@ -2161,8 +2326,37 @@ int main(int argc, char * const *argv)
      int encrypt_data = 1;           // -x (no-AEAD flag) flips to 0
      const char *stats_udp_target = NULL;  // -Y host:port; NULL = disabled
  
@@ -1046,10 +1057,10 @@ index e7a2cdc..a994aa7 100644
      const bool use_qdisc;
      const uint32_t fwmark_base;
 diff --git a/src/tx_cmd.c b/src/tx_cmd.c
-index d963aeb..7d139a4 100644
+index d963aeb..61906c0 100644
 --- a/src/tx_cmd.c
 +++ b/src/tx_cmd.c
-@@ -297,6 +297,63 @@ int get_radio(char *progname, int port, int argc, char **argv)
+@@ -297,6 +297,71 @@ int get_radio(char *progname, int port, int argc, char **argv)
      return rc;
  }
  
@@ -1071,14 +1082,22 @@ index d963aeb..7d139a4 100644
 +        rc = send_command(port, greq, offsetof(cmd_req_t, u), &resp);
 +        if (rc == 0)
 +        {
++            int floor = (int)resp.u.cmd_get_peek.base_mcs - (int)resp.u.cmd_get_peek.max_delta;
++            if (floor < 0) floor = 0;
 +            printf("enabled=%d\n"
 +                   "drop_enabled=%d\n"
 +                   "n_rules=%d\n"
-+                   "n_sig_rules=%d\n",
++                   "n_sig_rules=%d\n"
++                   "base_mcs=%d\n"
++                   "max_delta=%d\n"
++                   "protect_floor_mcs=%d\n",
 +                   resp.u.cmd_get_peek.enabled,
 +                   resp.u.cmd_get_peek.drop_enabled,
 +                   resp.u.cmd_get_peek.n_rules,
-+                   resp.u.cmd_get_peek.n_sig_rules);
++                   resp.u.cmd_get_peek.n_sig_rules,
++                   resp.u.cmd_get_peek.base_mcs,
++                   resp.u.cmd_get_peek.max_delta,
++                   floor);
 +        }
 +        return rc;
 +    }
@@ -1113,7 +1132,7 @@ index d963aeb..7d139a4 100644
  int main(int argc, char **argv)
  {
      int port;
-@@ -313,7 +370,7 @@ int main(int argc, char **argv)
+@@ -313,7 +378,7 @@ int main(int argc, char **argv)
  
      if (argc < 3)
      {
@@ -1122,7 +1141,7 @@ index d963aeb..7d139a4 100644
          fprintf(stderr, "WFB-ng version %s\n", WFB_VERSION);
          fprintf(stderr, "WFB-ng home page: <http://wfb-ng.org>\n");
          return 1;
-@@ -339,6 +396,10 @@ int main(int argc, char **argv)
+@@ -339,6 +404,10 @@ int main(int argc, char **argv)
      {
          return get_radio(argv[0], port, argc - 2, argv + 2);
      }
@@ -1134,7 +1153,7 @@ index d963aeb..7d139a4 100644
      {
          fprintf(stderr, "Unknown command: %s\n", command);
 diff --git a/src/tx_cmd.h b/src/tx_cmd.h
-index a992d0d..fc707be 100644
+index a992d0d..f78e155 100644
 --- a/src/tx_cmd.h
 +++ b/src/tx_cmd.h
 @@ -5,6 +5,12 @@
@@ -1163,7 +1182,7 @@ index a992d0d..fc707be 100644
      } __attribute__ ((packed)) u;
  } __attribute__ ((packed)) cmd_req_t;
  
-@@ -58,5 +70,13 @@ typedef struct {
+@@ -58,5 +70,16 @@ typedef struct {
              bool vht_mode;
              uint8_t vht_nss;
          } __attribute__ ((packed)) cmd_get_radio;
@@ -1174,6 +1193,9 @@ index a992d0d..fc707be 100644
 +            uint8_t drop_enabled;
 +            uint8_t n_rules;       /* action rules */
 +            uint8_t n_sig_rules;   /* signal rules (>=1: mandatory FEC_CLOSE) */
++            uint8_t base_mcs;      /* live base MCS (radiotap mcs_index) */
++            uint8_t max_delta;     /* largest PROTECT mcs_delta in the table; 0 if none.
++                                    * protect floor = max(0, base_mcs - max_delta). */
 +        } __attribute__ ((packed)) cmd_get_peek;
      } __attribute__ ((packed)) u;
  } __attribute__ ((packed)) cmd_resp_t;

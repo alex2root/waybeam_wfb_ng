@@ -179,11 +179,24 @@ fi
 
 WFB_DIR="$BUILD_DIR/wfb-ng"
 
+# Pin wfb-ng to a known-good commit so shm-input.patch + peek.patch keep
+# applying.  Upstream master drifts; --depth 1 alone pins nothing.  Bump this
+# (and re-verify both patches) when intentionally moving to a newer wfb-ng.
+WFB_NG_SHA="af6ba85eface27279709477077d3362c69bb2576"
+
 if [ ! -d "$WFB_DIR" ]; then
-    echo "=== Cloning wfb-ng ==="
-    git clone --depth 1 https://github.com/svpcom/wfb-ng.git "$WFB_DIR"
+    echo "=== Cloning wfb-ng (pinned $WFB_NG_SHA) ==="
+    git init -q "$WFB_DIR"
+    git -C "$WFB_DIR" remote add origin https://github.com/svpcom/wfb-ng.git
+    git -C "$WFB_DIR" fetch --depth 1 origin "$WFB_NG_SHA"
+    git -C "$WFB_DIR" checkout -q FETCH_HEAD
 else
     echo "=== wfb-ng already cloned ==="
+    cur=$(git -C "$WFB_DIR" rev-parse HEAD 2>/dev/null || echo unknown)
+    if [ "$cur" != "$WFB_NG_SHA" ]; then
+        echo "WARNING: wfb-ng HEAD ($cur) != pinned $WFB_NG_SHA."
+        echo "         Run with --clean to re-pin if the patches stop applying."
+    fi
 fi
 
 # ── Step 3: Copy venc_ring files + create pcap stub ──────────────────

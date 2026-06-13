@@ -81,9 +81,14 @@ if [ -d "$SCRIPT_DIR/build/wfb-ng" ]; then
     echo "=== Reusing wfb-ng tree from $WFB_DIR ==="
 else
     WFB_DIR="$BUILD_DIR/wfb-ng"
+    # Pin to the same known-good commit as build-armv7.sh so both patches apply.
+    WFB_NG_SHA="af6ba85eface27279709477077d3362c69bb2576"
     if [ ! -d "$WFB_DIR" ]; then
-        echo "=== Cloning wfb-ng into $WFB_DIR ==="
-        git clone --depth 1 https://github.com/svpcom/wfb-ng.git "$WFB_DIR"
+        echo "=== Cloning wfb-ng into $WFB_DIR (pinned $WFB_NG_SHA) ==="
+        git init -q "$WFB_DIR"
+        git -C "$WFB_DIR" remote add origin https://github.com/svpcom/wfb-ng.git
+        git -C "$WFB_DIR" fetch --depth 1 origin "$WFB_NG_SHA"
+        git -C "$WFB_DIR" checkout -q FETCH_HEAD
     fi
 fi
 

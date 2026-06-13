@@ -196,6 +196,8 @@ typedef struct {
 	union {
 		RadioBody                                          get_radio;
 		struct { uint8_t k, n; uint16_t fec_timeout_ms; } get_fec;
+		struct { uint8_t enabled, drop_enabled, n_rules, n_sig_rules,
+		         base_mcs, max_delta; }                    get_peek;
 	} u;
 } CmdResp;
 #pragma pack(pop)
@@ -1458,6 +1460,11 @@ static int wfb_get_radio(const Config *cfg, RadioBody *out);
 static int wfb_set_radio(const Config *cfg, const RadioBody *params);
 /* enabled/drop_enabled are 0/1 or WFB_PEEK_KEEP to leave that toggle alone. */
 static int wfb_set_peek(const Config *cfg, uint8_t enabled, uint8_t drop_enabled);
+/* Read back the wfb_tx peek state (CMD_GET_PEEK). All out params optional. */
+typedef struct {
+	int enabled, drop_enabled, n_rules, n_sig_rules, base_mcs, max_delta;
+} PeekStatus;
+static int wfb_get_peek(const Config *cfg, PeekStatus *out);
 
 /* fork+exec `iw dev <iface> set txpower fixed <mBm>`; returns iw's exit
  * status (0 on success). Synchronous; the call typically returns within
@@ -1819,6 +1826,15 @@ static int wcmd_dispatch(Config *cfg, const WcmdReq *req,
 			st->http_errors++;
 			st->last_status = resp->status;
 			return 0;
+		}
+		/* Read back the applied state so the log reflects the actual wfb_tx
+		 * config (and the protect floor it derived), not just our request. */
+		PeekStatus ps;
+		if (wfb_get_peek(cfg, &ps) == 0) {
+			int floor = ps.base_mcs - ps.max_delta;
+			if (floor < 0) floor = 0;
+			LOG_FEC("peek: enabled=%d drop=%d rules=%d base_mcs=%d floor_mcs=%d",
+			    ps.enabled, ps.drop_enabled, ps.n_rules, ps.base_mcs, floor);
 		}
 		resp->status        = WCMD_STATUS_OK;
 		resp->http_status   = htons(0);
@@ -2211,6 +2227,48 @@ static int wfb_set_peek(const Config *cfg, uint8_t enabled, uint8_t drop_enabled
 	if (n < (ssize_t)(sizeof(uint32_t) * 2)) return -1;
 	if (ntohl(resp.req_id) != req_id) return -1;
 	if (ntohl(resp.rc) != 0) return -1;
+	return 0;
+}
+
+/* CMD_GET_PEEK round-trip.  Returns 0 and fills *out on success.  The response
+ * body is 6 bytes (enabled, drop_enabled, n_rules, n_sig_rules, base_mcs,
+ * max_delta); a pre-peek wfb_tx replies rc=ENOTSUP and we return -1. */
+static int wfb_get_peek(const Config *cfg, PeekStatus *out)
+{
+	struct sockaddr_in dst;
+	if (resolve_ipv4(cfg->wfb_host, cfg->wfb_port, &dst) != 0) return -1;
+	int fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0) return -1;
+
+	uint32_t req_id = g_req_id++;
+	CmdReq req = {0};
+	req.req_id = htonl(req_id);
+	req.cmd_id = CMD_GET_PEEK;
+
+	if (sendto(fd, &req, CMD_REQ_HEADER, 0,
+	           (const struct sockaddr*)&dst, sizeof(dst)) != CMD_REQ_HEADER) {
+		close(fd);
+		return -1;
+	}
+
+	struct pollfd p = { .fd = fd, .events = POLLIN };
+	int pr = poll(&p, 1, 300);
+	if (pr <= 0) { close(fd); return -1; }
+
+	CmdResp resp = {0};
+	ssize_t n = recv(fd, &resp, sizeof(resp), 0);
+	close(fd);
+	if (n < (ssize_t)(sizeof(uint32_t) * 2 + sizeof(resp.u.get_peek))) return -1;
+	if (ntohl(resp.req_id) != req_id) return -1;
+	if (ntohl(resp.rc) != 0) return -1;
+	if (out) {
+		out->enabled      = resp.u.get_peek.enabled;
+		out->drop_enabled = resp.u.get_peek.drop_enabled;
+		out->n_rules      = resp.u.get_peek.n_rules;
+		out->n_sig_rules  = resp.u.get_peek.n_sig_rules;
+		out->base_mcs     = resp.u.get_peek.base_mcs;
+		out->max_delta    = resp.u.get_peek.max_delta;
+	}
 	return 0;
 }
 

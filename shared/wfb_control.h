@@ -15,6 +15,8 @@
  *     get_fec / get_radio:     no body
  *
  *   Response: uint32_t req_id (NB); uint32_t rc (NB); <union body>
+ *     get_peek   body (6 B):   enabled, drop_enabled, n_rules, n_sig_rules,
+ *                              base_mcs, max_delta
  *     On error (rc != 0): only req_id+rc are sent (body omitted).
  *
  * If the value of WFB_FEC_TIMEOUT_KEEP ever changes, update tx_cmd.h in

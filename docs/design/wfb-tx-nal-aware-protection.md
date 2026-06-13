@@ -28,11 +28,22 @@ spec and this repo disagree, **this document wins** for implementation.
 > `/api/v1/cmd`, and the WebUI (Vehicle Control tab) has peek/drop ON/OFF
 > buttons + dropdown entries.
 >
+> `CMD_GET_PEEK` reports `enabled`, `drop`, `n_rules`, `n_sig_rules`,
+> `base_mcs`, `max_delta` (→ protect floor); `wfb_tx_cmd peek status` prints
+> them and `link_controller` reads them back via `wfb_get_peek()` after each
+> toggle. The `wfb-ng` clone is **pinned** to `af6ba85` in `build-armv7.sh` /
+> `build-openwrt.sh` (shallow fetch-by-SHA).
+>
 > Verified on the host: peek unit test (26 checks) passes; `wfb_tx` +
 > `wfb_tx_cmd` compile (`-Wall`) and **link** clean with `peek.o`;
 > `link_controller` + `gs_supervisor` build (`-Wall -Wextra`); `make test`
-> 58/58 green. Not yet done: on-target bench/loopback (§10.2-10.6), the
-> venc-repo `build_wfb_tx.sh` wiring, and the wfb-ng SHA pin (§7).
+> 58/58 green. Not yet done: on-target bench/loopback (§10.2-10.6) and the
+> venc-repo `build_wfb_tx.sh` wiring.
+>
+> **Merge note:** the unmerged PR #58 rewrites `ground/webui/gs.html`,
+> `ground/gs_supervisor.{c,h}`, and `vehicle/link_controller.c` (the same files
+> this work touches). Expect conflicts; rebase this branch onto #58 once it
+> lands rather than the reverse, since the peek edits are small and localized.
 
 The design intent in `CLAUDE.md` — *"M-bit in wfb_tx aligns every frame's
 final block, so block loss never contaminates adjacent frames"* — describes a
