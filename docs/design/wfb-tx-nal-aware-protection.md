@@ -45,6 +45,44 @@ spec and this repo disagree, **this document wins** for implementation.
 > this work touches). Expect conflicts; rebase this branch onto #58 once it
 > lands rather than the reverse, since the peek edits are small and localized.
 
+## Update — 2026-06-14: FEC-close evolved (gate → proportional-parity SHORT_TAIL) — PR #64
+
+The per-frame `FEC_CLOSE` this plan re-introduced had a cost that §7 open-item #5
+anticipated: closing a near-empty block **pads it up to `k` on-air + emits a full
+`n−k` parity set**, so a P-frame-heavy 60/120 fps stream put ~`fec_n` packets on
+air per frame → SHM ring backpressure → random video drops. PR #64 ships the fix
+in two stages (full rationale + wire spec: **`docs/design/peek-proportional-parity.md`**):
+
+1. **Gate** (default). Only honour the per-frame close once the open block holds
+   ≥ k/2 data fragments; smaller frames carry into the next block. Stops the
+   drops; gives up some per-frame isolation.
+2. **Proportional-parity SHORT_TAIL close** — `wfb_tx --peek-short-tail`
+   (S99wfb env `wfbshorttail=1`), default **off**. Instead of on-air padding,
+   `close_block_short()` sends one boundary marker fragment (FEC_ONLY,
+   `fragment_idx == j` = real-data count, tagged with the always-zero top bit of
+   the 64-bit `data_nonce`, `WFB_NONCE_SHORT_TAIL`) + `p = round(j·(n−k)/k)`
+   proportional parity. The RX masks the bit off, synthesizes `[j+1, k)` locally
+   as canonical FEC_ONLY zero-pad, and decodes. Restores full per-frame isolation
+   (every frame closes) at ~27% fewer on-air packets vs the gate. Device-verified
+   on real RF (`dec_err=0`); host FEC roundtrip 6700/6700.
+
+**This supersedes two claims below:**
+- §0 TL;DR row *"`wfb_rx` needs no change"* — true for the gate / padding path,
+  but **the SHORT_TAIL close requires a SHORT_TAIL-aware RX** (the synthesis +
+  marker-validation hunk in `peek.patch` `rx.cpp`). Deploy the RX before flipping
+  the TX flag; old RX would stall short blocks.
+- §7 open item #5 (per-frame close × partial-block parity airtime) — **resolved**:
+  short-tail sizes parity to the actual data (`p ∝ j`) with no on-air padding,
+  which is strictly better than the `-r` partial-block ratio for the
+  one-block-per-frame case.
+
+**`-x` plaintext note (extends §4):** SHORT_TAIL adds the nonce top bit (still
+inside the AEAD AAD, so authenticated in encrypt mode) + the marker fragment, so
+PROTECT/close are no longer strictly byte-identical across `-x`. In plaintext
+mode the RX **validates the marker** (FEC_ONLY, `packet_size==0`, `1 ≤ j < fec_k`)
+before synthesizing, so a forged/corrupt fragment can't bulk-synthesize zero-pad
+into a live block.
+
 The design intent in `CLAUDE.md` — *"M-bit in wfb_tx aligns every frame's
 final block, so block loss never contaminates adjacent frames"* — describes a
 mechanism that **was implemented at one point and then removed**; the
@@ -69,7 +107,7 @@ claim true again. (Stale-doc cleanup — the M-bit wording in `CLAUDE.md` and
 | "Add `peek.cpp` to Makefile/CMakeLists" | wfb_tx is built by **explicit per-file `g++` lines** in `wfb-ng/build-{armv7,aarch64,openwrt}.sh`, bypassing wfb-ng's own Makefile | Add a `peek.cpp` compile step + `src/peek.o` to the link line in **all three** build scripts; ship `peek.{hpp,cpp}` and the `tx.cpp`/`tx_cmd.*` edits inside `shm-input.patch` (or a companion `peek.patch` applied after it) |
 | `--peek-rule` parsing in `peek.hpp` | same | unchanged |
 | RTP marker is the frame-boundary signal | **Confirmed valid here** — SHM carries full RTP datagrams (`streamMode rtp`, slot = `maxPayloadSize + 12`, `docs/protocols/shm-input.md:98-99`) | marker-bit `BYTE_MASK{off=1,mask=0x80}` and NAL parsing apply byte-for-byte |
-| `wfb_rx` needs no change | same — and the repo's RX already **suppresses synthetic FEC_ONLY slots** from `fec_recovered` (`shm-input.patch` rx.cpp hunk) | marker-close blocks are already RX-correct; nothing to do on the ground |
+| `wfb_rx` needs no change | same — and the repo's RX already **suppresses synthetic FEC_ONLY slots** from `fec_recovered` (`shm-input.patch` rx.cpp hunk) | marker-close blocks are already RX-correct; nothing to do on the ground. **⚠ Superseded for `--peek-short-tail` (PR #64): that mode DOES require a SHORT_TAIL-aware RX — see the 2026-06-14 update above.** |
 | waybeam encoder changes: none | **The `TRAIL_N`/`TRAIL_R` rewrite lives in the sibling `waybeam_venc` repo** (#142), not here | the `refpred` profile depends on that external rewrite being deployed; `idr` profile has no such dependency |
 
 ---
@@ -347,12 +385,13 @@ $CROSS_CXX -o wfb_tx src/tx.o src/peek.o src/zfex.o src/wifibroadcast.o src/venc
    cost. Bench whether the selector needs a PROTECT-aware airtime margin, or
    whether keeping Δ small for the `refpred` base + bursty `idr` is enough
    (spec §9 airtime budget).
-5. **Per-frame close × `-r` partial-block parity.** Marker-close makes most
-   blocks *small* (a P-frame is often 1-3 packets « `k`), so each closes as a
-   partial block whose parity count is governed by `-r` (`shm-input.md:150`),
-   not by `n-k`. Confirm the protection/airtime trade-off of `-r` under
-   one-block-per-frame: the removed M-bit implementation presumably tuned this,
-   so check git history for the prior `-r` guidance before re-deriving.
+5. **Per-frame close × `-r` partial-block parity.** ✅ **RESOLVED by PR #64** —
+   see the 2026-06-14 update above. Marker-close makes most blocks *small* (a
+   P-frame is often 1-3 packets « `k`); the gate path closes them as a padded
+   full block + full `n-k` parity (the airtime waste this item warned about), and
+   `--peek-short-tail` replaces that with `p ∝ j` proportional parity and no
+   on-air padding. (Original note retained: the parity count was governed by `-r`
+   (`shm-input.md:150`), not `n-k`; the removed M-bit impl presumably tuned this.)
 6. **Pin the wfb-ng clone.** `build-*.sh` clones `--depth 1` master (§0.1).
    Pin a SHA so the spec's stock-symbol claims (`init_radiotap_header`,
    `inject_packet`, the `CMD_SET_RADIO` handler, the UDP send site) can't drift
