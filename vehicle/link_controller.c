@@ -1,11 +1,12 @@
 /*
  * link_controller — merged adaptive controller for the wfb-ng POC.
  *
- * Combines fec_controller (FEC k/n sizing from venc sidecar + tx stats) and
- * mcs_selector (MCS bucket selection from rx_ant RSSI + loss) into a single
- * binary. Both control loops live in the same poll() event loop, share the
- * wfb_tx control socket, share a RadioState snapshot, and feed a unified
- * REST + SSE + WebUI on a single port (default 8765).
+ * Combines FEC k/n sizing (venc sidecar + tx stats) and the unified MCS
+ * control law (V+2 PER probe promote/demote + live-video-PER and RSSI
+ * floor/fade guard-rail demotes) into a single binary. Both control loops
+ * live in the same poll() event loop, share the wfb_tx control socket,
+ * share a RadioState snapshot, and feed a unified REST + SSE + WebUI on a
+ * single port (default 8765).
  *
  * Coordination:
  *   - mcs subsystem writes CMD_SET_RADIO (mcs_index only, every other field
@@ -278,19 +279,15 @@ typedef struct {
 		 * for running mcs alone. */
 		bool     enabled;
 
-		/* Adaptive payload sizing. Disabled by default — when off, the
-		 * controller never writes outgoing.maxPayloadSize and venc keeps
-		 * whatever it was started with. Enabled via --max-payload N at
-		 * startup, where N is the operator's path-MTU commitment in
-		 * bytes (576..4000). The selector consults a static
-		 * bitrate→payload tier table (see PAYLOAD_TABLE) and clamps to
-		 * [payload_min, payload_max]. payload_max is *startup-only* and
-		 * intentionally absent from the live tunable registry;
-		 * payload_min is live-mutable. The table is operator-empirical
-		 * — values measured to keep pps under ~1100 across the
-		 * realistic bitrate range; override locally if your hardware
-		 * differs. */
-		int      payload_max;        /* 0 = feature off */
+		/* Adaptive payload sizing. Off (payload_max = 0): the
+		 * controller never writes outgoing.maxPayloadSize and venc
+		 * keeps whatever it was started with. The --max-payload CLI
+		 * enable was dropped in the public-surface slimdown; the sizing
+		 * machinery below (PAYLOAD_TABLE tier selector, clamped to
+		 * [payload_min, payload_max]) is kept intact for an expert
+		 * re-enable. The table is operator-empirical — values measured
+		 * to keep pps under ~1100 across the realistic bitrate range. */
+		int      payload_max;        /* 0 = feature off (no setter today) */
 		int      payload_min;        /* clamped against the venc API floor (576) */
 
 		/* Safe-startup: write a known-safe (bitrate, payload) pair to
@@ -326,46 +323,73 @@ typedef struct {
 		char     stats_host[64];     /* UDP listener for wfb_rx -Y JSON */
 		uint16_t stats_port;
 
-		/* RSSI thresholds (dBm) */
-		float    rssi_thresh_low;
-		float    rssi_thresh_high;
-		float    rssi_deadband_db;
-
 		/* Smoothing */
 		float    rssi_ewma_alpha;
 		float    loss_ewma_alpha;
 		int      rssi_aggregator;
 
-		/* Loss penalty (split lost vs recovered). */
-		float    loss_lost_penalty_db_per_pct;
-		float    loss_recovered_penalty_db_per_pct;
-		float    loss_penalty_max_db;
-
-		/* Asymmetric gating */
-		int      up_consecutive;
-		int      down_consecutive;
-		float    up_cooldown_s;
+		/* Demote rate-limit (shared by every demote rule) */
 		float    down_cooldown_s;
 
 		/* Failsafe */
 		float    failsafe_timeout_s;
-		int      failsafe_recovery_consecutive;
 
-		/* Oscillation */
+		/* Change-rate accounting window (stats only: changes_in_window) */
 		float    oscillation_window_s;
-		int      oscillation_threshold;
-		float    oscillation_backoff;
 
-		/* Active range buckets */
-		int      mcs_bucket_0;
-		int      mcs_bucket_1;
-		int      mcs_bucket_2;
+		/* Committed-MCS clamp */
 		int      mcs_min;
 		int      mcs_max;
 
 		/* Behavior */
-		bool     start_low;
 		bool     enabled;
+
+		/* ── Unified MCS control law (PER probe + RSSI guard-rails) ──
+		 * Rules, first match wins, per rx_ant datagram:
+		 *   1. reactive demote   — live video PER >= demote_per_milli
+		 *   2. RSSI floor demote — smoothed RSSI <= rssi_floor_dbm
+		 *   3. RSSI fade demote  — slope <= -rssi_fade_db_per_s while
+		 *                          smoothed RSSI <= rssi_fade_arm_dbm
+		 *   4. probe V+2         — fail -> pre-empt demote; clean -> promote
+		 *                          (promote blocked while 2/3 active)
+		 *   5. hold
+		 * See MCS_STRATEGY.md. Cold start begins at mcs_min and lets
+		 * the probe climb. */
+		int      probe_clean_milli; /* V+2 PER <= this (‰) -> promote-ok    */
+		int      probe_fail_milli;  /* V+2 PER >= this (‰) -> pre-empt demote*/
+		int      demote_per_milli;  /* live video PER >= this (‰) -> demote */
+		float    promote_dwell_s;   /* min dwell before a probe promote     */
+		float    probe_window_s;    /* nominal probe PER window (info)      */
+		float    probe_stale_age_s; /* ignore probe rungs older than this   */
+		/* RSSI guard-rails (rules 2/3). Floor is the deep-fade backstop
+		 * that still works when probe records are stale; fade is the
+		 * pre-emptive demote on fast signal collapse, armed only below
+		 * rssi_fade_arm_dbm so fades at strong signal are ignored. */
+		float    rssi_floor_dbm;    /* demote at/below                      */
+		float    rssi_fade_db_per_s;/* slope demote threshold (0 = off)     */
+		float    rssi_fade_arm_dbm; /* fade rule armed at/below this        */
+		float    rssi_floor_hyst_db;/* promote blocked <= floor + this      */
+		/* Transport backpressure coupling (anti death-spiral). When the
+		 * venc->wfb_tx SHM ring saturates, the probe/video PER reads high
+		 * from local airtime starvation, NOT RF — and demoting MCS starves
+		 * airtime further, deepening the saturation. pressure_demote_block
+		 * suppresses the PER-driven demotes (rules 1 + probe-fail) while the
+		 * sidecar reports in_pressure; the RF guards (floor/fade) stay live.
+		 * pressure_escape_s is the active escape: in_pressure held this long
+		 * with clean RF promotes MCS to drain the ring (0 = escape off). */
+		bool     pressure_demote_block;
+		float    pressure_escape_s;
+		/* Flap damping (promote-side only — demotes are never delayed):
+		 * re-promoting into/above the rung we last demoted from within
+		 * reentry_backoff_s requires reentry_dwell_s of clean probe
+		 * instead of promote_dwell_s. */
+		float    reentry_backoff_s; /* flap-guard window (0 = off)          */
+		float    reentry_dwell_s;   /* dwell for re-entry into failed rung  */
+		/* Probe producer (Phase 4). Feeder pacing; gated by mcs.enabled
+		 * (probe is mandatory for MCS — no separate live switch) and the
+		 * endpoints themselves are startup-only (--probe/--probe-feed). */
+		int      probe_feed_pps;    /* paced PRB packets per second         */
+		int      probe_feed_bytes;  /* PRB packet size (mirror video MTU-ish)*/
 	} mcs;
 
 	/* ── CSA subsystem (Channel Switch Announcement receiver) ──
@@ -440,6 +464,15 @@ typedef struct {
 	/* ── Common ── */
 	char     wfb_host[64];           /* shared wfb_tx control endpoint */
 	uint16_t wfb_port;
+	/* Probe wfb_tx endpoints (V+2 boundary-probe producer; REQUIRED
+	 * when mcs.enabled — the unified law promotes on probe data only).
+	 * The probe wfb_tx is spawned by S99wfb (parallel to the video
+	 * wfb_tx); we retune its MCS to current+2 via its own control
+	 * socket and feed it paced PRB packets on its udp input. */
+	char     probe_host[64];         /* probe wfb_tx control endpoint  */
+	uint16_t probe_port;
+	char     probe_feed_host[64];    /* probe wfb_tx udp_in (feeder)   */
+	uint16_t probe_feed_port;
 	int      api_port;               /* HTTP API on 127.0.0.1:N (0 disables) */
 	int      iface_mtu;              /* startup-only: ip link set dev <iface> mtu N
 	                                  * across {csa.iface, cmd.wfb_iface}. 0 = off.
@@ -1498,6 +1531,15 @@ typedef struct {
 	uint8_t  last_key;
 	int32_t  last_value;
 	int      last_http_status;
+	/* Radio write-through: set when a WFB_* radio key was successfully
+	 * applied to wfb_tx this dispatch. The main loop adopts the body into
+	 * its radio_body cache (and the selector, for the MCS key) — without
+	 * this, the cache desyncs and (a) the realign never sees the operator
+	 * change, (b) the probe PHY mirror keeps the old bandwidth, and (c)
+	 * the next selector commit rebuilds its SET from the stale cache and
+	 * silently reverts the operator's write. */
+	bool      radio_written;
+	RadioBody radio_written_body;
 } WcmdState;
 
 /* Build the venc /api/v1 path for a given (key, value). path must be
@@ -1795,11 +1837,14 @@ static int wcmd_dispatch(Config *cfg, const WcmdReq *req,
 
 	/* wfb_tx control keys go to a local wfb_cmd round-trip rather than
 	 * the venc HTTP surface.  Read current radio/fec state, mutate just
-	 * the requested field, write back via SET_RADIO / SET_FEC.  Caveat:
-	 * link_controller's adaptive FEC and MCS subsystems will overwrite
-	 * these on their next tick — toggle WCMD_KEY_FEC_ENABLED=0 /
-	 * WCMD_KEY_MCS_ENABLED=0 first if you want manual control to
-	 * stick. */
+	 * the requested field, write back via SET_RADIO / SET_FEC.
+	 * Radio keys write through to the main loop's radio_body cache (see
+	 * WcmdState.radio_written): non-MCS PHY fields (bandwidth/gi/stbc/
+	 * ldpc) STICK — future commit bodies carry them. The MCS key is
+	 * adopted into the selector as the new rung, but the adaptive law
+	 * keeps moving it — toggle WCMD_KEY_MCS_ENABLED=0 first if you want
+	 * manual MCS to stick. FEC k/n is still overwritten by the FEC
+	 * subsystem on its next commit (WCMD_KEY_FEC_ENABLED=0 to hold). */
 	if (key >= WCMD_KEY_WFB_FEC_K && key <= WCMD_KEY_WFB_SHORT_GI) {
 		if (cfg->dry_run) {
 			resp->status = WCMD_STATUS_OK;
@@ -1850,6 +1895,10 @@ static int wcmd_dispatch(Config *cfg, const WcmdReq *req,
 			default: break;
 			}
 			rc = wfb_set_radio(cfg, &r);
+			if (rc == 0) {
+				st->radio_written      = true;
+				st->radio_written_body = r;
+			}
 		}
 		if (rc != 0) {
 			resp->status = WCMD_STATUS_HTTP_ERROR;
@@ -2037,10 +2086,13 @@ static int wfb_get_radio(const Config *cfg, RadioBody *out)
 	return 0;
 }
 
-static int wfb_set_radio(const Config *cfg, const RadioBody *params)
+/* SET_RADIO against an explicit control endpoint. Used for both the video
+ * wfb_tx (cfg->wfb_*) and the probe wfb_tx (cfg->probe_*). */
+static int wfb_set_radio_at(const char *host, uint16_t port,
+                            const RadioBody *params)
 {
 	struct sockaddr_in dst;
-	if (resolve_ipv4(cfg->wfb_host, cfg->wfb_port, &dst) != 0) return -1;
+	if (resolve_ipv4(host, port, &dst) != 0) return -1;
 	int fd = socket(AF_INET, SOCK_DGRAM, 0);
 	if (fd < 0) return -1;
 
@@ -2070,6 +2122,11 @@ static int wfb_set_radio(const Config *cfg, const RadioBody *params)
 	if (ntohl(resp.req_id) != req_id) return -1;
 	if (ntohl(resp.rc) != 0) return -1;
 	return 0;
+}
+
+static int wfb_set_radio(const Config *cfg, const RadioBody *params)
+{
+	return wfb_set_radio_at(cfg->wfb_host, cfg->wfb_port, params);
 }
 
 /* ── MCS-down ordered-commit machinery ─────────────────────────────────
@@ -2195,7 +2252,20 @@ typedef struct {
 	float  smoothed_diversity;
 	bool   have_rssi;
 	bool   have_loss;
+	/* RSSI slope (dB/s): per-sample derivative of smoothed_rssi, itself
+	 * EWMA'd with a fixed alpha. NOTE on latency: this is two cascaded
+	 * first-order filters (rssi_ewma + slope ewma, each tau ~0.28 s at
+	 * 10 Hz), so a real -12 dB/s fade crosses the default -10 dB/s
+	 * threshold only after ~0.9 s (~11 dB of drop). The fade rule is a
+	 * BACKSTOP that genuinely pre-empts only fast fades (>~20 dB/s);
+	 * near-threshold fades are usually caught by the PER rule (loss
+	 * EWMA alpha 0.5, ~0.2 s) or the floor first. Feeds rule 3. */
+	float    slope_db_s;
+	float    slope_prev_rssi;
+	uint64_t slope_prev_us;
 } Scorer;
+
+#define SLOPE_EWMA_ALPHA 0.3f
 
 typedef struct {
 	float raw_rssi;
@@ -2213,8 +2283,7 @@ typedef struct {
 	/* Distinct adapters that delivered ≥1 data fragment in the last
 	 * interval.  -1 = unknown (older RX without the patch). */
 	int   adapter_count;
-	float loss_penalty_db;
-	float effective_rssi;
+	float rssi_slope_db_s;
 	/* Per-antenna avg dBm — for /status sparklines. -200 = unset. */
 	int   ant_count;
 	float ant_avg[ANT_MAX];
@@ -2228,12 +2297,15 @@ static void scorer_reset(Scorer *s)
 	s->smoothed_diversity = 0.0f;
 	s->have_rssi = false;
 	s->have_loss = false;
+	s->slope_db_s = 0.0f;
+	s->slope_prev_rssi = 0.0f;
+	s->slope_prev_us = 0;
 }
 
 static bool scorer_update(Scorer *s, const Config *cfg, const char *body,
                           long pkt_uniq, long pkt_lost, long pkt_fec_recovered,
                           long pkt_diversity, int adapters_seen,
-                          Score *out)
+                          uint64_t now, Score *out)
 {
 	float best = -200.0f;
 	float sum = 0.0f;
@@ -2284,6 +2356,34 @@ static bool scorer_update(Scorer *s, const Config *cfg, const char *body,
 		s->smoothed_rssi = a * raw + (1.0f - a) * s->smoothed_rssi;
 	}
 
+	/* RSSI slope: derivative of the smoothed series, EWMA'd.
+	 *  - dt < 10 ms: burst-drained datagram (the rx_ant drain loop can
+	 *    process up to 32 queued datagrams microseconds apart after an
+	 *    event-loop stall). Carries no rate information — skip the
+	 *    sample entirely: no decay, baseline untouched, so the next
+	 *    well-spaced sample still computes a true derivative.
+	 *  - dt > 2 s: a fade rate measured before a multi-second blackout
+	 *    says nothing about now — reset the slope to 0 (one EWMA decay
+	 *    step is NOT enough: a pre-outage -20 dB/s would survive as
+	 *    -14 and spuriously trip the fade rule on recovery). */
+	bool slope_baseline = true;
+	if (s->slope_prev_us != 0 && now > s->slope_prev_us) {
+		float dt = (float)(now - s->slope_prev_us) / 1e6f;
+		if (dt < 0.01f) {
+			slope_baseline = false;
+		} else if (dt <= 2.0f) {
+			float inst = (s->smoothed_rssi - s->slope_prev_rssi) / dt;
+			s->slope_db_s = SLOPE_EWMA_ALPHA * inst +
+			                (1.0f - SLOPE_EWMA_ALPHA) * s->slope_db_s;
+		} else {
+			s->slope_db_s = 0.0f;
+		}
+	}
+	if (slope_baseline) {
+		s->slope_prev_rssi = s->smoothed_rssi;
+		s->slope_prev_us = now;
+	}
+
 	long denom = pkt_uniq > 0 ? pkt_uniq : 1;
 	float lost_r  = (pkt_lost          > 0) ? (float)pkt_lost          / (float)denom : 0.0f;
 	float recov_r = (pkt_fec_recovered > 0) ? (float)pkt_fec_recovered / (float)denom : 0.0f;
@@ -2308,12 +2408,6 @@ static bool scorer_update(Scorer *s, const Config *cfg, const char *body,
 		s->smoothed_diversity = a * div_r + (1.0f - a) * s->smoothed_diversity;
 	}
 
-	float penalty =
-		cfg->mcs.loss_lost_penalty_db_per_pct      * 100.0f * s->smoothed_lost +
-		cfg->mcs.loss_recovered_penalty_db_per_pct * 100.0f * s->smoothed_recov;
-	if (penalty < 0.0f) penalty = 0.0f;
-	if (penalty > cfg->mcs.loss_penalty_max_db) penalty = cfg->mcs.loss_penalty_max_db;
-
 	out->raw_rssi = raw;
 	out->smoothed_rssi = s->smoothed_rssi;
 	out->lost_ratio = lost_r;
@@ -2323,68 +2417,82 @@ static bool scorer_update(Scorer *s, const Config *cfg, const char *body,
 	out->diversity_ratio = div_r;
 	out->smoothed_diversity_ratio = s->smoothed_diversity;
 	out->adapter_count = adapters_seen;
-	out->loss_penalty_db = penalty;
-	out->effective_rssi = s->smoothed_rssi - penalty;
+	out->rssi_slope_db_s = s->slope_db_s;
 	return true;
 }
 
-static int bucket_from_rssi(float rssi, int current, const Config *cfg)
-{
-	float lo = cfg->mcs.rssi_thresh_low;
-	float hi = cfg->mcs.rssi_thresh_high;
-	float db = cfg->mcs.rssi_deadband_db;
-
-	if (current < 0) {
-		if (rssi <  lo) return 0;
-		if (rssi <  hi) return 1;
-		return 2;
-	}
-	if (current == 0) {
-		if (rssi >= lo + db)
-			return (rssi >= hi + db) ? 2 : 1;
-		return 0;
-	}
-	if (current == 1) {
-		if (rssi <  lo - db) return 0;
-		if (rssi >= hi + db) return 2;
-		return 1;
-	}
-	/* current == 2 */
-	if (rssi <  hi - db)
-		return (rssi <  lo - db) ? 0 : 1;
-	return 2;
-}
-
-static int mcs_for_bucket(int bucket, const Config *cfg)
-{
-	int mcs;
-	switch (bucket) {
-	case 0:  mcs = cfg->mcs.mcs_bucket_0; break;
-	case 1:  mcs = cfg->mcs.mcs_bucket_1; break;
-	default: mcs = cfg->mcs.mcs_bucket_2; break;
-	}
-	if (mcs < cfg->mcs.mcs_min) mcs = cfg->mcs.mcs_min;
-	if (mcs > cfg->mcs.mcs_max) mcs = cfg->mcs.mcs_max;
-	return mcs;
-}
-
 typedef struct {
-	int       current_bucket;
 	int       current_mcs;
 	uint64_t  last_change_us;
 	uint64_t  last_datagram_us;
-	int       pending_bucket;
-	int       pending_streak;
 	bool      in_failsafe;
-	int       recovery_streak;
 	uint64_t  changes_us[OSC_RING];
 	int       changes_count;
 	int       changes_head;
 	uint32_t  commit_count;
+	/* RSSI guard-rail state for /status: which rule (floor/fade) is
+	 * currently suppressing promotes. Refreshed every selector_update. */
+	bool      rssi_floor_active;
+	bool      rssi_fade_active;
+	/* Fade persistence: consecutive datagrams meeting the fade condition.
+	 * The DEMOTE needs FADE_PERSIST_SAMPLES in a row (RSSI noise of ±10dB
+	 * raw produces single-sample slope spikes past the threshold with
+	 * alternating sign — a real fade holds the sign); the instantaneous
+	 * condition still vetoes promotes (cheap, retried next tick). */
+	int       fade_streak;
+	/* Flap guard ("penalty box"): the highest rung we demoted FROM in the
+	 * current failure episode. Re-promoting into/above it within
+	 * reentry_backoff_s requires reentry_dwell_s of clean probe instead
+	 * of promote_dwell_s — a rung that just failed needs longer proof.
+	 * Every further demote refreshes the window, so a flapping boundary
+	 * stretches its own period instead of oscillating at dwell rate.
+	 * Demotes are never delayed by this. */
+	int       flap_guard_mcs;
+	uint64_t  flap_guard_us;
+	/* Transport backpressure tracking (anti death-spiral). pressure_since_us
+	 * is the timestamp of the first datagram in the current contiguous
+	 * in_pressure run (0 = not under pressure); the escape fires once it has
+	 * been held pressure_escape_s. escape_count is a /status observability
+	 * counter. */
+	uint64_t  pressure_since_us;
+	uint32_t  pressure_escape_count;
 } Selector;
 
+/* ── Boundary-probe PER state (2026-06-08 control law) ───────────────────
+ * The vehicle drives a probe wfb_tx at the V+2 boundary rung; the GS measures
+ * per-rung PER and forwards `{"type":"probe",...}` records up the same rx_ant
+ * tunnel. Phase 1 records + surfaces them only — no decision use yet. Indexed
+ * by absolute MCS so a swept/multi-rung prototype feed lands cleanly too. */
+#define PROBE_MCS_MAX 16
+typedef struct {
+	long     accounted;   /* recv+lost in the latest window for this rung   */
+	long     lost;
+	int      per_milli;   /* lost*1000/accounted, rounded; -1 = no traffic  */
+	uint64_t last_us;     /* local rx time of the latest record (staleness) */
+	uint64_t ts_ms;       /* producer-side timestamp from the record        */
+	uint32_t records;     /* total records seen at this rung                */
+	bool     valid;       /* at least one record observed                  */
+} ProbeRung;
+
+typedef struct {
+	ProbeRung rung[PROBE_MCS_MAX];
+	uint64_t  last_any_us;   /* local rx time of any probe record  */
+	uint32_t  total_records;
+	uint32_t  parse_errors;
+	/* Commit gate (§5.1 retune-ordering invariant): stamped whenever the
+	 * committed video MCS changes. The control law refuses to act on any
+	 * rung record that arrived before the gate, so a pre-commit reading
+	 * (e.g. the clean rung[6] that justified a promote we then reverted)
+	 * can never re-promote after a demote. Belt-and-suspenders on top of
+	 * the GS bucketing by *received* MCS — pre-retune probe traffic lands
+	 * in the old rung, never the new V+2. */
+	uint64_t  gate_us;
+} ProbeState;
+
+static inline void probe_state_init(ProbeState *p) { memset(p, 0, sizeof(*p)); }
+
 typedef enum {
-	SD_NONE = 0, SD_INIT, SD_DOWN, SD_UP, SD_FAILSAFE, SD_RECOVERED
+	SD_NONE = 0, SD_INIT, SD_DOWN, SD_UP, SD_FAILSAFE
 } SelectDecision;
 
 static const char *sd_name(SelectDecision d)
@@ -2394,24 +2502,26 @@ static const char *sd_name(SelectDecision d)
 	case SD_DOWN:       return "down";
 	case SD_UP:         return "up";
 	case SD_FAILSAFE:   return "failsafe";
-	case SD_RECOVERED:  return "recovered";
 	default:            return "none";
 	}
 }
 
 static void selector_init(Selector *s)
 {
-	s->current_bucket = -1;
 	s->current_mcs = -1;
 	s->last_change_us = 0;
 	s->last_datagram_us = 0;
-	s->pending_bucket = -1;
-	s->pending_streak = 0;
 	s->in_failsafe = false;
-	s->recovery_streak = 0;
 	s->changes_count = 0;
 	s->changes_head = 0;
 	s->commit_count = 0;
+	s->rssi_floor_active = false;
+	s->rssi_fade_active = false;
+	s->fade_streak = 0;
+	s->flap_guard_mcs = -1;
+	s->flap_guard_us = 0;
+	s->pressure_since_us = 0;
+	s->pressure_escape_count = 0;
 }
 
 static void selector_expire_changes(Selector *s, const Config *cfg, uint64_t now)
@@ -2441,25 +2551,34 @@ static void selector_record_change(Selector *s, const Config *cfg, uint64_t now)
 	selector_expire_changes(s, cfg, now);
 }
 
-static bool selector_is_oscillating(const Selector *s, const Config *cfg)
-{
-	return s->changes_count >= cfg->mcs.oscillation_threshold;
-}
-
+/* Commit an ABSOLUTE mcs index. Clamps to [mcs_min,mcs_max] and records the
+ * change in the rolling change-rate ring (changes_in_window stat). */
 static SelectDecision selector_commit(Selector *s, const Config *cfg,
-                                      int bucket, uint64_t now,
+                                      int target_mcs, uint64_t now,
                                       SelectDecision reason, int *out_mcs)
 {
-	int prev_mcs = s->current_mcs;
-	s->current_bucket = bucket;
-	s->current_mcs = mcs_for_bucket(bucket, cfg);
-	if (prev_mcs != s->current_mcs) {
+	if (target_mcs < cfg->mcs.mcs_min) target_mcs = cfg->mcs.mcs_min;
+	if (target_mcs > cfg->mcs.mcs_max) target_mcs = cfg->mcs.mcs_max;
+	int prev = s->current_mcs;
+	s->current_mcs = target_mcs;
+	if (prev != s->current_mcs) {
 		s->last_change_us = now;
 		selector_record_change(s, cfg, now);
 		s->commit_count++;
+		/* Flap guard: any downward commit from a valid rung stamps the
+		 * episode. Keep the HIGHEST failed rung while the window is
+		 * live (a cascade 5->1 means "5 failed", the rungs below were
+		 * collateral — they re-climb at normal dwell, only the final
+		 * step back into 5 needs the longer proof). */
+		if (prev >= 0 && s->current_mcs < prev) {
+			uint64_t backoff_us =
+			    (uint64_t)(cfg->mcs.reentry_backoff_s * 1e6f);
+			if (s->flap_guard_mcs < prev ||
+			    now - s->flap_guard_us > backoff_us)
+				s->flap_guard_mcs = prev;
+			s->flap_guard_us = now;
+		}
 	}
-	s->pending_bucket = -1;
-	s->pending_streak = 0;
 	*out_mcs = s->current_mcs;
 	return reason;
 }
@@ -2472,74 +2591,189 @@ static SelectDecision selector_tick_no_data(Selector *s, const Config *cfg,
 	if (s->last_datagram_us == 0) return SD_NONE;
 	uint64_t gap = now - s->last_datagram_us;
 	if (gap < (uint64_t)(cfg->mcs.failsafe_timeout_s * 1e6f)) return SD_NONE;
-	if (s->in_failsafe && s->current_bucket == 0) return SD_NONE;
+	if (s->in_failsafe && s->current_mcs == cfg->mcs.mcs_min) return SD_NONE;
 
-	LOG_MCS("failsafe: no rx_ant for %.2fs (>%.2fs) — forcing bucket 0",
+	LOG_MCS("failsafe: no rx_ant for %.2fs (>%.2fs) — forcing lowest MCS",
 	    (double)gap / 1e6, (double)cfg->mcs.failsafe_timeout_s);
 	s->in_failsafe = true;
-	s->recovery_streak = 0;
-	return selector_commit(s, cfg, 0, now, SD_FAILSAFE, out_mcs);
+	/* Guard flags are only refreshed per-datagram; with the stream dead
+	 * they would freeze at their last value and lie in /status. */
+	s->rssi_floor_active = false;
+	s->rssi_fade_active  = false;
+	return selector_commit(s, cfg, cfg->mcs.mcs_min, now,
+	                       SD_FAILSAFE, out_mcs);
 }
 
+/* Unified MCS control law — PER probe primary + RSSI guard-rails.
+ * Called once per video rx_ant datagram (the fast clock); reads the latest
+ * V+2 probe rung as an async side input. Rules, first match wins:
+ *   1. reactive demote   — live video PER spike (fast/deep backstop; can
+ *                          cascade rung-by-rung at the rx_ant rate)
+ *   2. RSSI floor demote — smoothed RSSI at/below rssi_floor_dbm. Deep-fade
+ *                          backstop that still works when the probe stream
+ *                          died with the fade.
+ *   3. RSSI fade demote  — smoothed RSSI collapsing faster than
+ *                          rssi_fade_db_per_s while at/below
+ *                          rssi_fade_arm_dbm. Pre-emptive: fires before PER
+ *                          damage on fast walk-away/obstruction fades.
+ *                          rssi_fade_db_per_s == 0 disables the rule.
+ *   4. probe V+2         — fail -> pre-emptive demote (restores the +2
+ *                          cushion); clean -> +1 viable by monotonicity ->
+ *                          promote. Promotes are BLOCKED while a floor/fade
+ *                          condition holds (floor guard has
+ *                          rssi_floor_hyst_db of hysteresis so promotes
+ *                          don't resume on the knife-edge), and promotes
+ *                          back into a recently-failed rung wait
+ *                          reentry_dwell_s (flap guard).
+ *   5. hold
+ * Demotes are FAST (down_cooldown_s, cascade allowed, never delayed by the
+ * flap guard); promotes are SLOW (probe-verified per rung, dwell, guards).
+ * All demotes step current_mcs-1. */
+#define FADE_PERSIST_SAMPLES 3
+
 static SelectDecision selector_update(Selector *s, const Config *cfg,
-                                      const Score *score, uint64_t now,
-                                      int *out_mcs)
+                                      const Score *score,
+                                      const ProbeState *probe,
+                                      bool in_pressure,
+                                      uint64_t now, int *out_mcs)
 {
 	s->last_datagram_us = now;
 
-	int candidate = bucket_from_rssi(score->effective_rssi,
-	                                 s->current_bucket, cfg);
+	/* Data is flowing again — clear any watchdog failsafe; the probe will
+	 * climb back up from mcs_min. */
+	if (s->in_failsafe) s->in_failsafe = false;
 
-	if (s->current_bucket < 0)
-		return selector_commit(s, cfg, candidate, now, SD_INIT, out_mcs);
+	/* Transport backpressure persistence: track the start of the current
+	 * contiguous in_pressure run (the escape rule keys on how long it has
+	 * held). Reset the moment the ring drains. */
+	if (in_pressure) {
+		if (s->pressure_since_us == 0) s->pressure_since_us = now;
+	} else {
+		s->pressure_since_us = 0;
+	}
+	/* While the SHM ring is saturated the probe/video PER is airtime-
+	 * starvation, not RF — suppress the PER-driven demotes so backpressure
+	 * can't pull MCS down (which would deepen the saturation). RF guards
+	 * (floor/fade) below are transport-independent and stay live. */
+	bool pressure_block = in_pressure && cfg->mcs.pressure_demote_block;
 
-	if (s->in_failsafe) {
-		float floor_eff = cfg->mcs.rssi_thresh_low + cfg->mcs.rssi_deadband_db;
-		if (score->effective_rssi >= floor_eff) {
-			s->recovery_streak++;
-			if (s->recovery_streak >= cfg->mcs.failsafe_recovery_consecutive) {
-				LOG_MCS("failsafe: recovered after %d good samples",
-				    s->recovery_streak);
-				s->in_failsafe = false;
-				s->recovery_streak = 0;
-			} else {
-				return SD_NONE;
-			}
-		} else {
-			s->recovery_streak = 0;
-			return SD_NONE;
+	/* Cold start: begin at the floor and let the probe promote upward. */
+	if (s->current_mcs < 0)
+		return selector_commit(s, cfg, cfg->mcs.mcs_min, now,
+		                       SD_INIT, out_mcs);
+
+	float elapsed = (float)(now - s->last_change_us) / 1e6f;
+	bool can_demote = s->current_mcs > cfg->mcs.mcs_min &&
+	                  elapsed >= cfg->mcs.down_cooldown_s;
+
+	/* RSSI guard-rail conditions. fade_sample is the instantaneous
+	 * condition: it vetoes promotes immediately (cheap — promotes retry
+	 * next tick) but only DEMOTES after FADE_PERSIST_SAMPLES consecutive
+	 * hits. Rationale: ±10 dB raw RSSI flap produces single-sample slope
+	 * spikes past the threshold with alternating sign; a real fade holds
+	 * the sign, so the streak filters noise without adding meaningful
+	 * latency (3 samples = 0.3 s at 10 Hz on top of the slope filter). */
+	bool floor_hit = score->smoothed_rssi <= cfg->mcs.rssi_floor_dbm;
+	bool fade_sample = cfg->mcs.rssi_fade_db_per_s > 0.0f &&
+	                   score->smoothed_rssi <= cfg->mcs.rssi_fade_arm_dbm &&
+	                   score->rssi_slope_db_s <= -cfg->mcs.rssi_fade_db_per_s;
+	s->fade_streak = fade_sample ? s->fade_streak + 1 : 0;
+	bool fade_hit = s->fade_streak >= FADE_PERSIST_SAMPLES;
+	s->rssi_floor_active = floor_hit;
+	s->rssi_fade_active  = fade_hit;
+
+	/* 1. REACTIVE DEMOTE — live video PER spike. smoothed_lost_ratio is a
+	 *    fraction (0..1); compare in per-mille. Suppressed under transport
+	 *    backpressure: the "loss" is local airtime starvation, not RF. */
+	if (!pressure_block &&
+	    score->smoothed_lost_ratio * 1000.0f >= (float)cfg->mcs.demote_per_milli) {
+		if (can_demote)
+			return selector_commit(s, cfg, s->current_mcs - 1, now,
+			                       SD_DOWN, out_mcs);
+		return SD_NONE;  /* at floor or cooling down */
+	}
+
+	/* 2/3. RSSI GUARD-RAIL DEMOTES — floor first (deeper condition). These
+	 *      are real RF signals, independent of the transport, so they fire
+	 *      even under backpressure (a genuine fade still demotes). */
+	if ((floor_hit || fade_hit) && can_demote)
+		return selector_commit(s, cfg, s->current_mcs - 1, now,
+		                       SD_DOWN, out_mcs);
+
+	/* 3.5 BACKPRESSURE ESCAPE — sustained in_pressure with CLEAN RF means the
+	 *     current rung is under-provisioned for the offered load, and the
+	 *     probe PER is contaminated by airtime starvation. Climb to free
+	 *     airtime and drain the ring; this inverts the death-spiral where a
+	 *     low rung starves its own probe and locks the controller down. The
+	 *     RF demotes above already handled a genuine fade, so reaching here
+	 *     with in_pressure means RF is fine. Steps one rung per down_cooldown
+	 *     until the ring drains (in_pressure clears) or mcs_max. */
+	if (in_pressure && cfg->mcs.pressure_escape_s > 0.0f &&
+	    s->pressure_since_us != 0 && s->current_mcs < cfg->mcs.mcs_max) {
+		bool rf_clean = !floor_hit && !fade_sample &&
+		    score->smoothed_rssi >
+		        cfg->mcs.rssi_floor_dbm + cfg->mcs.rssi_floor_hyst_db;
+		float held = (float)(now - s->pressure_since_us) / 1e6f;
+		if (rf_clean && held >= cfg->mcs.pressure_escape_s &&
+		    elapsed >= cfg->mcs.down_cooldown_s) {
+			s->pressure_escape_count++;
+			LOG_MCS("pressure-escape promote: held=%.1fs rssi=%.0f %d->%d",
+			    held, score->smoothed_rssi,
+			    s->current_mcs, s->current_mcs + 1);
+			return selector_commit(s, cfg, s->current_mcs + 1, now,
+			                       SD_UP, out_mcs);
 		}
 	}
 
-	if (candidate == s->current_bucket) {
-		s->pending_bucket = -1;
-		s->pending_streak = 0;
-		return SD_NONE;
+	/* 4. PROBE-DRIVEN promote / pre-emptive demote at the V+2 boundary.
+	 *    Records must be (a) fresh per probe_stale_age_s AND (b) newer than
+	 *    the commit gate — a reading taken before the last MCS commit is
+	 *    never acted on (§5.1 retune-ordering invariant). */
+	int v2 = s->current_mcs + 2;
+	if (v2 >= 0 && v2 < PROBE_MCS_MAX) {
+		const ProbeRung *pr = &probe->rung[v2];
+		float age = pr->valid ? (float)(now - pr->last_us) / 1e6f : 1e9f;
+		if (pr->valid && pr->per_milli >= 0 &&
+		    pr->last_us >= probe->gate_us &&
+		    age <= cfg->mcs.probe_stale_age_s) {
+			/* Fail branch FIRST: with an inverted config
+			 * (clean >= fail, warned at startup/set) a failing rung
+			 * must demote, never promote. */
+			if (pr->per_milli >= cfg->mcs.probe_fail_milli) {
+				/* +2 fail while video healthy -> conservative demote 1.
+				 * Suppressed under backpressure (the rung PER is airtime-
+				 * starved, not RF — the escape rule above handles it). */
+				if (!pressure_block && can_demote)
+					return selector_commit(s, cfg, s->current_mcs - 1,
+					                       now, SD_DOWN, out_mcs);
+			} else if (pr->per_milli <= cfg->mcs.probe_clean_milli) {
+				/* +2 clean -> +1 guaranteed viable (monotonic) -> promote,
+				 * unless an RSSI guard condition is (near-)active. The
+				 * guard uses the INSTANT fade sample (not the persisted
+				 * streak): vetoing a promote on a transient is cheap. */
+				bool promote_guard = fade_sample ||
+				    score->smoothed_rssi <= cfg->mcs.rssi_floor_dbm +
+				                            cfg->mcs.rssi_floor_hyst_db;
+				/* Flap guard: re-promoting into/above the rung that
+				 * failed this episode needs the longer re-entry dwell. */
+				float need_dwell = cfg->mcs.promote_dwell_s;
+				if (s->flap_guard_mcs >= 0 &&
+				    s->current_mcs + 1 >= s->flap_guard_mcs &&
+				    (float)(now - s->flap_guard_us) / 1e6f <
+				        cfg->mcs.reentry_backoff_s &&
+				    cfg->mcs.reentry_dwell_s > need_dwell)
+					need_dwell = cfg->mcs.reentry_dwell_s;
+				if (!promote_guard &&
+				    s->current_mcs < cfg->mcs.mcs_max &&
+				    elapsed >= need_dwell)
+					return selector_commit(s, cfg, s->current_mcs + 1,
+					                       now, SD_UP, out_mcs);
+			}
+			/* clean < per < fail -> hold */
+		}
+		/* stale / no probe -> hold (RSSI rules 2/3 cover deep fades) */
 	}
-
-	if (candidate != s->pending_bucket) {
-		s->pending_bucket = candidate;
-		s->pending_streak = 1;
-	} else {
-		s->pending_streak++;
-	}
-
-	bool going_down = candidate < s->current_bucket;
-	int  required = going_down
-	    ? cfg->mcs.down_consecutive
-	    : cfg->mcs.up_consecutive;
-	if (s->pending_streak < required) return SD_NONE;
-
-	float elapsed = (float)(now - s->last_change_us) / 1e6f;
-	if (going_down) {
-		if (elapsed < cfg->mcs.down_cooldown_s) return SD_NONE;
-		return selector_commit(s, cfg, candidate, now, SD_DOWN, out_mcs);
-	}
-	float cooldown = cfg->mcs.up_cooldown_s;
-	if (selector_is_oscillating(s, cfg))
-		cooldown *= cfg->mcs.oscillation_backoff;
-	if (elapsed < cooldown) return SD_NONE;
-	return selector_commit(s, cfg, candidate, now, SD_UP, out_mcs);
+	return SD_NONE;
 }
 
 /* ─────────────────────────────────────────────────────────────────────
@@ -2555,6 +2789,12 @@ typedef struct {
 	size_t       offset;      /* offsetof(Config, sub.field) */
 	double       lo, hi;
 	const char  *help;
+	/* Public-surface bit. 1 = operator policy, shown by the default
+	 * /schema (and therefore the WebUI Tune tab). 0 (default) = expert
+	 * mechanics: still readable via /params and writable via /set, and
+	 * listed by /schema?all=1, but hidden from the default UI. New rows
+	 * are expert unless deliberately promoted. */
+	unsigned     pub;
 } TunableDesc;
 
 #define OFF(field)         offsetof(Config, field)
@@ -2569,7 +2809,7 @@ static const TunableDesc TUNABLES[] = {
 	{"common.verbose",         SUB_COMMON, TF_INT,   OFF(verbose),     0, 4,      "log verbosity"},
 
 	/* ── fec ── */
-	{"fec.enabled",                 SUB_FEC, TF_BOOL,  OFF_FEC(enabled),                 0, 0,      "enable FEC subsystem"},
+	{"fec.enabled",                 SUB_FEC, TF_BOOL,  OFF_FEC(enabled),                 0, 0,      "enable FEC subsystem", 1},
 	{"fec.mtu",                     SUB_FEC, TF_INT,   OFF_FEC(mtu),                     100, 65000, "RTP payload budget per packet"},
 	{"fec.min_k",                   SUB_FEC, TF_INT,   OFF_FEC(min_k),                   1, 256,   "min k after sizing"},
 	{"fec.max_k",                   SUB_FEC, TF_INT,   OFF_FEC(max_k),                   1, 256,   "max k after sizing"},
@@ -2586,9 +2826,9 @@ static const TunableDesc TUNABLES[] = {
 	{"fec.k_down_dwell_s",          SUB_FEC, TF_FLOAT, OFF_FEC(k_down_dwell_s),          0.0, 600.0,"k-down dwell"},
 	{"fec.k_up_dwell_s",            SUB_FEC, TF_FLOAT, OFF_FEC(k_up_dwell_s),            0.0, 600.0,"k-up dwell (0 = legacy fast-up)"},
 	{"fec.startup_grace_s",         SUB_FEC, TF_FLOAT, OFF_FEC(startup_grace_s),         0.0, 60.0, "suppress emits for first N s"},
-	{"fec.safety_margin",           SUB_FEC, TF_FLOAT, OFF_FEC(safety_margin),           0.05, 1.0, "fraction of phy_mbps usable"},
-	{"fec.bitrate_min_kbps",        SUB_FEC, TF_LONG,  OFF_FEC(bitrate_min_kbps),        1, 200000, "bitrate floor (kbps)"},
-	{"fec.bitrate_max_kbps",        SUB_FEC, TF_LONG,  OFF_FEC(bitrate_max_kbps),        0, 200000, "bitrate ceiling (kbps; 0 = unlimited)"},
+	{"fec.safety_margin",           SUB_FEC, TF_FLOAT, OFF_FEC(safety_margin),           0.05, 1.0, "fraction of phy_mbps usable", 1},
+	{"fec.bitrate_min_kbps",        SUB_FEC, TF_LONG,  OFF_FEC(bitrate_min_kbps),        1, 200000, "bitrate floor (kbps)", 1},
+	{"fec.bitrate_max_kbps",        SUB_FEC, TF_LONG,  OFF_FEC(bitrate_max_kbps),        0, 200000, "bitrate ceiling (kbps; 0 = unlimited)", 1},
 	{"fec.bitrate_tolerance",       SUB_FEC, TF_FLOAT, OFF_FEC(bitrate_tolerance),       0.0, 1.0,  "re-apply tolerance"},
 	{"fec.bitrate_grace_s",         SUB_FEC, TF_FLOAT, OFF_FEC(bitrate_grace_s),         0.0, 60.0, "post-bitrate-write FEC suppress"},
 	{"fec.mcs_settle_s",            SUB_FEC, TF_FLOAT, OFF_FEC(mcs_settle_s),            0.0, 60.0, "post-MCS-change FEC suppress"},
@@ -2604,31 +2844,33 @@ static const TunableDesc TUNABLES[] = {
 	{"fec.backpressure_fill_pct",   SUB_FEC, TF_INT,   OFF_FEC(backpressure_fill_pct),   0, 100,    "skip-FEC threshold (output queue fill %)"},
 
 	/* ── mcs ── */
-	{"mcs.enabled",                       SUB_MCS, TF_BOOL,  OFF_MCS(enabled),                       0, 0,       "enable MCS subsystem"},
-	{"mcs.rssi_thresh_low",               SUB_MCS, TF_FLOAT, OFF_MCS(rssi_thresh_low),               -120.0, 0.0,"lower RSSI threshold (dBm)"},
-	{"mcs.rssi_thresh_high",              SUB_MCS, TF_FLOAT, OFF_MCS(rssi_thresh_high),              -120.0, 0.0,"upper RSSI threshold (dBm)"},
-	{"mcs.rssi_deadband_db",              SUB_MCS, TF_FLOAT, OFF_MCS(rssi_deadband_db),              0.0, 20.0,  "symmetric deadband around thresholds"},
+	{"mcs.enabled",                       SUB_MCS, TF_BOOL,  OFF_MCS(enabled),                       0, 0,       "enable MCS subsystem", 1},
 	{"mcs.rssi_ewma_alpha",               SUB_MCS, TF_FLOAT, OFF_MCS(rssi_ewma_alpha),               0.001, 1.0, "EWMA alpha for RSSI"},
 	{"mcs.loss_ewma_alpha",               SUB_MCS, TF_FLOAT, OFF_MCS(loss_ewma_alpha),               0.001, 1.0, "EWMA alpha for loss ratio"},
 	{"mcs.rssi_aggregator",               SUB_MCS, TF_INT,   OFF_MCS(rssi_aggregator),               0, 2,       "0=best_avg 1=best_max 2=mean_avg"},
-	{"mcs.loss_lost_penalty_db_per_pct",  SUB_MCS, TF_FLOAT, OFF_MCS(loss_lost_penalty_db_per_pct),  0.0, 5.0,   "dB per % of post-FEC lost"},
-	{"mcs.loss_recovered_penalty_db_per_pct", SUB_MCS, TF_FLOAT, OFF_MCS(loss_recovered_penalty_db_per_pct), 0.0, 5.0, "dB per % of fec_recovered (default 0; FEC working = no signal)"},
-	{"mcs.loss_penalty_max_db",           SUB_MCS, TF_FLOAT, OFF_MCS(loss_penalty_max_db),           0.0, 60.0,  "cap on combined loss penalty"},
-	{"mcs.up_consecutive",                SUB_MCS, TF_INT,   OFF_MCS(up_consecutive),                1, 20,      "samples required to commit up"},
-	{"mcs.down_consecutive",              SUB_MCS, TF_INT,   OFF_MCS(down_consecutive),              1, 20,      "samples required to commit down"},
-	{"mcs.up_cooldown_s",                 SUB_MCS, TF_FLOAT, OFF_MCS(up_cooldown_s),                 0.0, 60.0,  "min seconds between up-commits"},
-	{"mcs.down_cooldown_s",               SUB_MCS, TF_FLOAT, OFF_MCS(down_cooldown_s),               0.0, 60.0,  "min seconds between down-commits"},
-	{"mcs.failsafe_timeout_s",            SUB_MCS, TF_FLOAT, OFF_MCS(failsafe_timeout_s),            0.05, 30.0, "watchdog gap before forcing bucket 0"},
-	{"mcs.failsafe_recovery_consecutive", SUB_MCS, TF_INT,   OFF_MCS(failsafe_recovery_consecutive), 1, 20,      "good samples before unfreezing"},
-	{"mcs.oscillation_window_s",          SUB_MCS, TF_FLOAT, OFF_MCS(oscillation_window_s),          0.5, 60.0,  "rolling window for change-rate"},
-	{"mcs.oscillation_threshold",         SUB_MCS, TF_INT,   OFF_MCS(oscillation_threshold),         2, OSC_RING,"changes/window before backoff"},
-	{"mcs.oscillation_backoff",           SUB_MCS, TF_FLOAT, OFF_MCS(oscillation_backoff),           1.0, 20.0,  "up-cooldown multiplier when oscillating"},
-	{"mcs.mcs_bucket_0",                  SUB_MCS, TF_INT,   OFF_MCS(mcs_bucket_0),                  0, 11,      "mcs_index for bucket 0 (lowest)"},
-	{"mcs.mcs_bucket_1",                  SUB_MCS, TF_INT,   OFF_MCS(mcs_bucket_1),                  0, 11,      "mcs_index for bucket 1 (mid)"},
-	{"mcs.mcs_bucket_2",                  SUB_MCS, TF_INT,   OFF_MCS(mcs_bucket_2),                  0, 11,      "mcs_index for bucket 2 (top)"},
-	{"mcs.mcs_min",                       SUB_MCS, TF_INT,   OFF_MCS(mcs_min),                       0, 11,      "clamp emit lower bound"},
-	{"mcs.mcs_max",                       SUB_MCS, TF_INT,   OFF_MCS(mcs_max),                       0, 11,      "clamp emit upper bound"},
-	{"mcs.start_low",                     SUB_MCS, TF_BOOL,  OFF_MCS(start_low),                     0, 0,       "force range[0] mcs at startup (default off)"},
+	{"mcs.down_cooldown_s",               SUB_MCS, TF_FLOAT, OFF_MCS(down_cooldown_s),               0.0, 60.0,  "min seconds between demotes (all rules)"},
+	{"mcs.failsafe_timeout_s",            SUB_MCS, TF_FLOAT, OFF_MCS(failsafe_timeout_s),            0.05, 30.0, "watchdog gap before forcing mcs_min", 1},
+	{"mcs.oscillation_window_s",          SUB_MCS, TF_FLOAT, OFF_MCS(oscillation_window_s),          0.5, 60.0,  "rolling window for changes_in_window stat"},
+	{"mcs.mcs_min",                       SUB_MCS, TF_INT,   OFF_MCS(mcs_min),                       0, 11,      "clamp emit lower bound (also the cold-start rung)", 1},
+	{"mcs.mcs_max",                       SUB_MCS, TF_INT,   OFF_MCS(mcs_max),                       0, 11,      "clamp emit upper bound", 1},
+	/* RSSI guard knobs are public pending the walkout field-calibration
+	 * cycle (bench RSSI never arms them); revisit after calibration. */
+	{"mcs.rssi_floor_dbm",                SUB_MCS, TF_FLOAT, OFF_MCS(rssi_floor_dbm),                -120.0, 0.0,"guard: demote at/below this smoothed RSSI", 1},
+	{"mcs.rssi_fade_db_per_s",            SUB_MCS, TF_FLOAT, OFF_MCS(rssi_fade_db_per_s),            0.0, 60.0,  "guard: demote when RSSI falls faster (0=off)", 1},
+	{"mcs.rssi_fade_arm_dbm",             SUB_MCS, TF_FLOAT, OFF_MCS(rssi_fade_arm_dbm),             -120.0, 0.0,"guard: fade rule armed at/below this RSSI", 1},
+	{"mcs.rssi_floor_hyst_db",            SUB_MCS, TF_FLOAT, OFF_MCS(rssi_floor_hyst_db),            0.0, 20.0,  "guard: promotes blocked at/below floor + this (must exceed smoothed RSSI noise)", 1},
+	{"mcs.pressure_demote_block",         SUB_MCS, TF_BOOL,  OFF_MCS(pressure_demote_block),         0, 0,       "backpressure: suppress PER/probe demotes while transport in_pressure (anti death-spiral)", 1},
+	{"mcs.pressure_escape_s",             SUB_MCS, TF_FLOAT, OFF_MCS(pressure_escape_s),             0.0, 30.0,  "backpressure: in_pressure held >= this with clean RF -> promote to drain ring (0 = off)", 1},
+	{"mcs.reentry_backoff_s",             SUB_MCS, TF_FLOAT, OFF_MCS(reentry_backoff_s),             0.0, 120.0, "flap guard: window after a demote during which re-entry needs the longer dwell (0 = off)"},
+	{"mcs.reentry_dwell_s",               SUB_MCS, TF_FLOAT, OFF_MCS(reentry_dwell_s),               0.0, 30.0,  "flap guard: dwell for promoting back into the rung that just failed"},
+	{"mcs.probe_clean_milli",             SUB_MCS, TF_INT,   OFF_MCS(probe_clean_milli),             0, 1000,    "probe: V+2 PER <= this permille -> promote-eligible"},
+	{"mcs.probe_fail_milli",              SUB_MCS, TF_INT,   OFF_MCS(probe_fail_milli),              0, 1000,    "probe: V+2 PER >= this permille -> pre-emptive demote"},
+	{"mcs.demote_per_milli",              SUB_MCS, TF_INT,   OFF_MCS(demote_per_milli),              0, 1000,    "probe: live video PER >= this permille -> reactive demote"},
+	{"mcs.promote_dwell_s",               SUB_MCS, TF_FLOAT, OFF_MCS(promote_dwell_s),               0.0, 60.0,  "probe: min dwell before a promote"},
+	{"mcs.probe_window_s",                SUB_MCS, TF_FLOAT, OFF_MCS(probe_window_s),                0.05, 10.0, "probe: nominal PER window (informational)"},
+	{"mcs.probe_stale_age_s",             SUB_MCS, TF_FLOAT, OFF_MCS(probe_stale_age_s),             0.1, 30.0,  "probe: ignore V+2 rungs older than this"},
+	{"mcs.probe_feed_pps",                SUB_MCS, TF_INT,   OFF_MCS(probe_feed_pps),                1, 200,     "probe: paced PRB feed rate (pkts/s)"},
+	{"mcs.probe_feed_bytes",              SUB_MCS, TF_INT,   OFF_MCS(probe_feed_bytes),              64, 1472,   "probe: PRB packet size (bytes)"},
 
 	/* ── cmd (venc command proxy on the rx_ant socket) ── */
 	{"cmd.enabled",          SUB_COMMON, TF_BOOL, OFF_CMD(enabled),          0, 0,      "enable venc command proxy on rx_ant socket"},
@@ -2679,6 +2921,10 @@ static int parse_strict_double(const char *s, double *out)
 	if (end == s) return -1;
 	while (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n') end++;
 	if (*end) return -1;
+	/* strtod happily parses "nan"/"inf"; NaN compares false against any
+	 * range bound so it would slip through tunable_write and silently
+	 * disarm comparison-based rules (e.g. the RSSI guard-rails). */
+	if (!isfinite(v)) return -1;
 	*out = v;
 	return 0;
 }
@@ -2787,26 +3033,32 @@ static int params_to_json(const Config *c, char *buf, size_t cap)
 }
 
 /* Schema describes each tunable with type/bounds/help so the WebUI can
- * render an input form without hard-coding field metadata. JSON array. */
-static int schema_to_json(char *buf, size_t cap)
+ * render an input form without hard-coding field metadata. JSON array.
+ * By default only the public (operator-policy) rows are listed; pass
+ * all=true to include the expert mechanics — /set accepts every key
+ * either way. */
+static int schema_to_json(char *buf, size_t cap, bool all)
 {
 	size_t pos = 0;
+	bool first = true;
 	int n = snprintf(buf + pos, cap - pos, "[");
 	if (n < 0) return -1;
 	pos += n;
 	for (size_t i = 0; i < TUNABLES_COUNT; i++) {
 		const TunableDesc *t = &TUNABLES[i];
+		if (!all && !t->pub) continue;
 		const char *type =
 			t->type == TF_INT   ? "int"   :
 			t->type == TF_LONG  ? "long"  :
 			t->type == TF_FLOAT ? "float" : "bool";
 		n = snprintf(buf + pos, cap - pos,
 			"%s{\"name\":\"%s\",\"subsys\":\"%s\",\"type\":\"%s\",\"lo\":%g,\"hi\":%g,\"help\":\"%s\"}",
-			i ? "," : "",
+			first ? "" : ",",
 			t->name, subsys_name(t->subsys), type,
 			t->lo, t->hi, t->help ? t->help : "");
 		if (n < 0 || (size_t)n >= cap - pos) return -1;
 		pos += n;
+		first = false;
 	}
 	n = snprintf(buf + pos, cap - pos, "]");
 	if (n < 0 || (size_t)n >= cap - pos) return -1;
@@ -2828,13 +3080,13 @@ typedef struct {
 	int                 last_written_payload;
 	uint64_t            last_stats_us;
 	uint64_t            last_rx_ant_us;
-	float               last_eff_rssi;
+	float               last_raw_rssi;
 	float               last_smoothed_rssi;
 	float               last_lost_ratio;
 	float               last_recov_ratio;
 	float               last_diversity_ratio;
 	int                 last_adapter_count;
-	float               last_loss_penalty_db;
+	float               last_rssi_slope_db_s;
 	int                 last_emit_mcs;
 	int                 ant_count;
 	float               ant_avg[ANT_MAX];
@@ -2859,21 +3111,31 @@ typedef struct {
 	int      pending_drop_ms_remaining;
 	/* venc command proxy snapshot (multiplexed onto rx_ant socket). */
 	const WcmdState *wcmd;
+	/* Boundary-probe PER snapshot (read-only; Phase 1 observability). */
+	const ProbeState *probe;
+	/* Probe producer state (Phase 4: feeder + retune reconciler). */
+	bool     probe_configured;     /* --probe endpoint present */
+	uint32_t probe_feed_seq;
+	int      probe_tuned_mcs;
+	uint32_t probe_retune_fails;
 } ApiSnapshot;
 
 static int append_score_json(char *buf, size_t cap, size_t pos,
                              const ApiSnapshot *s, bool include_ants)
 {
 	size_t start = pos;
+	/* lost/recov/diversity carry the SMOOTHED (EWMA) values the law
+	 * actually evaluates — named accordingly so consumers don't read
+	 * them as per-datagram instantaneous ratios. */
 	int n = snprintf(buf + pos, cap - pos,
-		"\"score\":{\"effective_rssi\":%.2f,\"smoothed_rssi\":%.2f,"
-		"\"lost_ratio\":%.4f,\"recov_ratio\":%.4f,"
-		"\"diversity_ratio\":%.4f,\"adapter_count\":%d,"
-		"\"loss_penalty_db\":%.2f}",
-		(double)s->last_eff_rssi, (double)s->last_smoothed_rssi,
+		"\"score\":{\"raw_rssi\":%.2f,\"smoothed_rssi\":%.2f,"
+		"\"smoothed_lost_ratio\":%.4f,\"smoothed_recov_ratio\":%.4f,"
+		"\"smoothed_diversity_ratio\":%.4f,\"adapter_count\":%d,"
+		"\"rssi_slope_db_s\":%.2f}",
+		(double)s->last_raw_rssi, (double)s->last_smoothed_rssi,
 		(double)s->last_lost_ratio, (double)s->last_recov_ratio,
 		(double)s->last_diversity_ratio, s->last_adapter_count,
-		(double)s->last_loss_penalty_db);
+		(double)s->last_rssi_slope_db_s);
 	if (n < 0 || (size_t)n >= cap - pos) return -1;
 	pos += n;
 	if (include_ants) {
@@ -3020,24 +3282,61 @@ static int append_mcs_json(char *buf, size_t cap, size_t pos,
 	double rx_age_s = s->last_rx_ant_us == 0
 		? -1.0
 		: (double)(now_us() - s->last_rx_ant_us) / 1e6;
+	/* Boundary-probe summary: surface the V+2 rung (the one the control
+	 * law will gate on) plus aggregate counters. Phase 1 = observability. */
+	uint64_t now = now_us();
+	int v2 = s->sel->current_mcs + 2;
+	const ProbeRung *pr = (s->probe && v2 >= 0 && v2 < PROBE_MCS_MAX
+	                       && s->probe->rung[v2].valid)
+	                      ? &s->probe->rung[v2] : NULL;
+	double probe_age_s = (s->probe && s->probe->last_any_us)
+	                     ? (double)(now - s->probe->last_any_us) / 1e6 : -1.0;
+	double v2_age_s = pr ? (double)(now - pr->last_us) / 1e6 : -1.0;
 	int n = snprintf(buf + pos, cap - pos,
-		"\"mcs\":{\"enabled\":%s,\"current_bucket\":%d,\"current_mcs\":%d,"
-		"\"in_failsafe\":%s,\"recovery_streak\":%d,"
-		"\"pending_bucket\":%d,\"pending_streak\":%d,"
+		"\"mcs\":{\"enabled\":%s,\"current_mcs\":%d,"
+		"\"in_failsafe\":%s,"
+		"\"rssi_guard\":{\"floor_active\":%s,\"fade_active\":%s},"
+		"\"pressure\":{\"active\":%s,\"held_s\":%.2f,\"escapes\":%u},"
+		"\"flap_guard\":{\"mcs\":%d,\"active\":%s},"
 		"\"commit_count\":%u,\"changes_in_window\":%d,"
 		"\"last_emit_mcs\":%d,\"rx_ant_age_s\":%.3f,"
 		"\"bitrate_lead_s\":%.3f,"
-		"\"pending_drop\":{\"active\":%s,\"target_mcs\":%d,\"ms_remaining\":%d}}",
+		"\"pending_drop\":{\"active\":%s,\"target_mcs\":%d,\"ms_remaining\":%d},"
+		"\"probe\":{\"records\":%u,\"parse_errors\":%u,\"age_s\":%.3f,"
+		"\"v2_mcs\":%d,\"v2_per_milli\":%d,\"v2_accounted\":%ld,\"v2_age_s\":%.3f,"
+		"\"v2_gated\":%s,"
+		"\"configured\":%s,\"feed_seq\":%u,"
+		"\"tuned_mcs\":%d,\"retune_fails\":%u}}",
 		s->cfg->mcs.enabled ? "true" : "false",
-		s->sel->current_bucket, s->sel->current_mcs,
-		s->sel->in_failsafe ? "true" : "false", s->sel->recovery_streak,
-		s->sel->pending_bucket, s->sel->pending_streak,
+		s->sel->current_mcs,
+		s->sel->in_failsafe ? "true" : "false",
+		s->sel->rssi_floor_active ? "true" : "false",
+		s->sel->rssi_fade_active ? "true" : "false",
+		s->sel->pressure_since_us != 0 ? "true" : "false",
+		s->sel->pressure_since_us != 0
+			? (double)(now - s->sel->pressure_since_us) / 1e6 : 0.0,
+		s->sel->pressure_escape_count,
+		s->sel->flap_guard_mcs,
+		(s->sel->flap_guard_mcs >= 0 && s->sel->flap_guard_us != 0 &&
+		 (double)(now - s->sel->flap_guard_us) / 1e6 <
+		     (double)s->cfg->mcs.reentry_backoff_s) ? "true" : "false",
 		s->sel->commit_count, s->sel->changes_count,
 		s->last_emit_mcs, rx_age_s,
 		(double)s->cfg->fec.bitrate_lead_s,
 		s->pending_drop_active ? "true" : "false",
 		s->pending_drop_target_mcs,
-		s->pending_drop_ms_remaining);
+		s->pending_drop_ms_remaining,
+		s->probe ? s->probe->total_records : 0u,
+		s->probe ? s->probe->parse_errors : 0u,
+		probe_age_s,
+		v2, pr ? pr->per_milli : -1,
+		pr ? pr->accounted : -1L, v2_age_s,
+		/* v2_gated: a fresh-looking rung the law refuses because the
+		 * record pre-dates the last commit (§5.1 gate) — otherwise
+		 * indistinguishable from one it will act on. */
+		(pr && s->probe && pr->last_us < s->probe->gate_us) ? "true" : "false",
+		s->probe_configured ? "true" : "false",
+		s->probe_feed_seq, s->probe_tuned_mcs, s->probe_retune_fails);
 	if (n < 0 || (size_t)n >= cap - pos) return -1;
 	return n;
 }
@@ -3594,7 +3893,8 @@ static void api_handle_request(ApiClient *c, Config *cfg, ApiSnapshot *snap)
 		else       api_send(c->fd, 500, "text/plain", "json overflow\n", 14);
 	}
 	else if (strcmp(path, "/schema") == 0) {
-		n = schema_to_json(body, sizeof(body));
+		bool all = qs && strstr(qs, "all=1") != NULL;
+		n = schema_to_json(body, sizeof(body), all);
 		if (n > 0) api_send(c->fd, 200, "application/json", body, n);
 		else       api_send(c->fd, 500, "text/plain", "json overflow\n", 14);
 	}
@@ -3735,81 +4035,41 @@ static void usage(const char *prog)
 	fprintf(stderr,
 		"Usage: %s [options]\n"
 		"\n"
+		"The CLI carries wiring/topology only. All tuning is live via the\n"
+		"HTTP API: GET /schema lists the operator-policy knobs (add ?all=1\n"
+		"for the expert mechanics), GET/SET via /set?key=value.\n"
+		"\n"
 		"Common:\n"
 		"  --wfb HOST:PORT          wfb_tx control endpoint (default 127.0.0.1:8000)\n"
 		"  --api-port N             HTTP API + WebUI on :N (default 8765; 0 disables)\n"
 		"  --dry-run                compute but do not send wfb_tx commands\n"
 		"  --iface-mtu N            ip link set dev <iface> mtu N at startup on\n"
-		"                           {csa.iface, wfb-iface}; range [576, 9000].\n"
-		"                           Use with --max-payload above 1472.\n"
+		"                           {csa-iface, wfb-iface}; range [576, 9000]\n"
 		"  -v, --verbose            extra logs\n"
 		"\n"
-		"FEC subsystem (--fec-* / disable with --no-fec):\n"
+		"FEC subsystem (disable with --no-fec):\n"
 		"  --no-fec                 disable FEC subsystem\n"
 		"  --sidecar HOST:PORT      venc sidecar (default 127.0.0.1:5602)\n"
 		"  --venc HOST:PORT         venc HTTP API (default 127.0.0.1:80)\n"
-		"  --wfb-stats-port N       UDP listener for wfb_tx -Y JSON (default 0 = poll mode)\n"
-		"  --mtu N                  packet size budget (default 1446)\n"
-		"  --min-k / --max-k N      k bounds (default 1 / 48)\n"
-		"  --ppf-deadband F         ±F*MTU slack at ppf bucket edges (default 0.15)\n"
-		"  --k-hyst-up N            min Δk to trigger an up-move (default 2)\n"
-		"  --cooldown-up F          min seconds between up-moves (default 1.0)\n"
-		"  --k-down-dwell F         k-down dwell (default 8.0)\n"
-		"  --k-up-dwell F           k-up dwell (default 2.0; 0 = legacy fast-up)\n"
-		"  --startup-grace F        suppress emits for first F s (default 2.0)\n"
-		"  --safety F               fraction of PHY rate usable (default 0.5)\n"
-		"  --bitrate-min N          bitrate floor in kbps (default 1000)\n"
-		"  --bitrate-max N          bitrate ceiling in kbps (default 0 = unlimited)\n"
-		"  --bitrate-tol F          bitrate re-apply tolerance (default 0.15)\n"
-		"  --bitrate-grace F        post-bitrate-write FEC suppress (default 2.0)\n"
-		"  --bitrate-lead-s F       MCS-down: lead between bitrate pre-drop and SET_RADIO (default 0.05)\n"
-		"  --mcs-settle-s F         post-MCS-change FEC suppress (default 5.0)\n"
-		"  --boost-s F              parity boost duration (default 3.0)\n"
-		"  --boost-mult F           parity multiplier during boost (default 1.3)\n"
-		"  --max-payload N          enable adaptive outgoing.maxPayloadSize via\n"
-		"                           bitrate→payload tier table\n"
-		"                           (576..4000; unset = feature off; startup-only).\n"
-		"                           ≤1472 keeps the path on a 1500 MTU; >1472\n"
-		"                           declares jumbo-capable end-to-end. Live\n"
-		"                           tunable: fec.payload_min (default 576).\n"
-		"  --no-safe-startup        disable one-time safe (bitrate, payload)\n"
-		"                           write to venc at controller start. Default\n"
-		"                           ON; bridges the gap between an inherited\n"
-		"                           dangerous venc state and the first natural\n"
-		"                           bitrate write.\n"
 		"  --safe-startup-bitrate N override safe-startup bitrate kbps (default 1500)\n"
-		"  --safe-startup-payload N override safe-startup payload bytes (default 1400)\n"
 		"\n"
-		"MCS subsystem (--mcs-* / disable with --no-mcs):\n"
-		"  --no-mcs                 disable MCS subsystem\n"
+		"MCS subsystem — unified PER-probe law (disable with --no-mcs):\n"
+		"  Promotes when the V+2 probe rung reads clean; demotes on live\n"
+		"  video PER, RSSI floor/fade guard-rails, or a failing V+2 rung.\n"
+		"  REQUIRES --probe (the V+2 producer) when enabled.\n"
+		"  --no-mcs                 disable MCS subsystem (FEC-only)\n"
 		"  --stats HOST:PORT        UDP listener for wfb_rx -Y rx_ant JSON (default 127.0.0.1:5801)\n"
-		"  --range low|med|high     preset bucket→mcs map (med = default)\n"
-		"  --rssi-low F             lower RSSI threshold dBm (default -70)\n"
-		"  --rssi-high F            upper RSSI threshold dBm (default -50)\n"
-		"  --deadband F             symmetric deadband dB (default 2.0)\n"
-		"  --rssi-alpha F           EWMA alpha for RSSI (default 0.3)\n"
-		"  --loss-alpha F           EWMA alpha for loss (default 0.5)\n"
-		"  --aggregator best_avg|best_max|mean_avg  (default best_avg)\n"
-		"  --loss-lost-pct F        dB per %% post-FEC lost (default 0.5)\n"
-		"  --loss-recov-pct F       dB per %% fec_recovered (default 0.0)\n"
-		"  --loss-cap F             max combined loss penalty dB (default 20)\n"
-		"  --up-consec N            samples needed up (default 3)\n"
-		"  --down-consec N          samples needed down (default 1)\n"
-		"  --up-cooldown F          min seconds between up-commits (default 3.0)\n"
-		"  --down-cooldown F        min seconds between down-commits (default 0.2)\n"
-		"  --failsafe F             watchdog gap before bucket 0 (default 0.5)\n"
-		"  --recover-consec N       good samples before unfreezing (default 3)\n"
-		"  --osc-window F           rolling window for change-rate (default 5.0)\n"
-		"  --osc-threshold N        changes/window before backoff (default 4)\n"
-		"  --osc-backoff F          up-cooldown multiplier when oscillating (default 3.0)\n"
-		"  --start-low              force range[0] mcs at startup (default off)\n"
+		"  --probe HOST:PORT        probe wfb_tx control endpoint (V+2 producer;\n"
+		"                           retuned to min(video_mcs+2,7) on every commit)\n"
+		"  --probe-feed HOST:PORT   probe wfb_tx udp input for the paced PRB feeder\n"
+		"  --failsafe F             watchdog gap before forcing mcs_min (default 0.5;\n"
+		"                           deployment-dependent — raise for lossy uplinks)\n"
 		"\n"
 		"CSA receiver (off unless --csa-iface set; reuses --stats listener):\n"
 		"  --csa-iface NAME         enable CSA receiver on iface (e.g. wlan0)\n"
-		"  --csa-allowlist CH,...   accepted target channels (default: any)\n"
-		"  --csa-bandwidth BW,...   accepted target bandwidths (default: any)\n"
-		"  --csa-cooldown-ms N      min gap between channel changes (default 2000)\n"
-		"  --csa-no-revert          do not auto-revert if link goes silent\n"
+		"\n"
+		"WCMD proxy:\n"
+		"  --wfb-iface NAME         iface for wfb_txpower writes\n"
 		"\n"
 		"  -h, --help               this message\n",
 		prog);
@@ -3830,22 +4090,6 @@ static int parse_hostport(const char *s, char *host, size_t host_sz,
 	return 0;
 }
 
-static int parse_aggregator(const char *s)
-{
-	if (strcmp(s, "best_avg") == 0) return AGG_BEST_AVG;
-	if (strcmp(s, "best_max") == 0) return AGG_BEST_MAX;
-	if (strcmp(s, "mean_avg") == 0) return AGG_MEAN_AVG;
-	return -1;
-}
-
-static int parse_range_preset(const char *s, Config *cfg)
-{
-	if (strcmp(s, "low") == 0)  { cfg->mcs.mcs_bucket_0 = 0; cfg->mcs.mcs_bucket_1 = 1; cfg->mcs.mcs_bucket_2 = 2; return 0; }
-	if (strcmp(s, "med") == 0)  { cfg->mcs.mcs_bucket_0 = 1; cfg->mcs.mcs_bucket_1 = 2; cfg->mcs.mcs_bucket_2 = 3; return 0; }
-	if (strcmp(s, "high") == 0) { cfg->mcs.mcs_bucket_0 = 2; cfg->mcs.mcs_bucket_1 = 3; cfg->mcs.mcs_bucket_2 = 4; return 0; }
-	return -1;
-}
-
 /* Cross-field consistency warnings. Per-field bounds are enforced by
  * tunable_write at /set time and by atoi/atof+range at CLI parse time;
  * this catches invariants spanning two fields. Run at startup and after
@@ -3856,15 +4100,34 @@ static int cfg_validate_warnings(const Config *c)
 {
 	int n = 0;
 	if (c->mcs.enabled &&
-	    c->mcs.rssi_thresh_low >= c->mcs.rssi_thresh_high) {
-		LOG_MCS("WARNING rssi_thresh_low (%.1f) >= rssi_thresh_high (%.1f) — bucket FSM will misbehave",
-		    (double)c->mcs.rssi_thresh_low,
-		    (double)c->mcs.rssi_thresh_high);
+	    c->mcs.rssi_fade_arm_dbm <= c->mcs.rssi_floor_dbm) {
+		LOG_MCS("WARNING rssi_fade_arm_dbm (%.1f) <= rssi_floor_dbm (%.1f) — fade rule can never fire before the floor rule",
+		    (double)c->mcs.rssi_fade_arm_dbm,
+		    (double)c->mcs.rssi_floor_dbm);
 		n++;
 	}
 	if (c->mcs.enabled && c->mcs.mcs_min > c->mcs.mcs_max) {
 		LOG_MCS("WARNING mcs_min (%d) > mcs_max (%d) — emit clamp will pin to mcs_max",
 		    c->mcs.mcs_min, c->mcs.mcs_max);
+		n++;
+	}
+	if (c->mcs.enabled &&
+	    c->mcs.probe_clean_milli >= c->mcs.probe_fail_milli) {
+		LOG_MCS("WARNING probe_clean_milli (%d) >= probe_fail_milli (%d) — clean band is empty, probe can only demote or hold",
+		    c->mcs.probe_clean_milli, c->mcs.probe_fail_milli);
+		n++;
+	}
+	if (c->mcs.enabled &&
+	    c->mcs.probe_fail_milli <= c->mcs.demote_per_milli) {
+		LOG_MCS("WARNING probe_fail_milli (%d) <= demote_per_milli (%d) — probe pre-empt cannot fire before the reactive rule",
+		    c->mcs.probe_fail_milli, c->mcs.demote_per_milli);
+		n++;
+	}
+	if (c->mcs.enabled && c->mcs.reentry_backoff_s > 0.0f &&
+	    c->mcs.reentry_dwell_s <= c->mcs.promote_dwell_s) {
+		LOG_MCS("WARNING reentry_dwell_s (%.1f) <= promote_dwell_s (%.1f) — flap guard adds no extra proof",
+		    (double)c->mcs.reentry_dwell_s,
+		    (double)c->mcs.promote_dwell_s);
 		n++;
 	}
 	if (c->fec.enabled && c->fec.min_k > c->fec.max_k) {
@@ -3895,6 +4158,9 @@ static void config_defaults(Config *c)
 {
 	/* Common */
 	strcpy(c->wfb_host, "127.0.0.1"); c->wfb_port = 8000;
+	/* Probe wfb_tx endpoints: off (port 0) until --probe / --probe-feed. */
+	strcpy(c->probe_host, "127.0.0.1");      c->probe_port = 0;
+	strcpy(c->probe_feed_host, "127.0.0.1"); c->probe_feed_port = 0;
 	c->api_port = 8765;
 	c->dry_run = false;
 	c->verbose = 0;
@@ -3950,33 +4216,59 @@ static void config_defaults(Config *c)
 	c->fec.skip_on_backpressure       = true;
 	c->fec.backpressure_fill_pct      = 80;
 
-	/* MCS defaults (lifted from mcs_selector.c). */
+	/* MCS defaults — unified PER-probe law (hardware-validated 2026-06-10;
+	 * legacy RSSI-bucket FSM removed the same day). */
 	c->mcs.enabled = true;
 	strcpy(c->mcs.stats_host, "127.0.0.1"); c->mcs.stats_port = 5801;
-	c->mcs.rssi_thresh_low  = -70.0f;
-	c->mcs.rssi_thresh_high = -50.0f;
-	c->mcs.rssi_deadband_db =  2.0f;
 	c->mcs.rssi_ewma_alpha = 0.3f;
 	c->mcs.loss_ewma_alpha = 0.5f;
 	c->mcs.rssi_aggregator = AGG_BEST_AVG;
-	c->mcs.loss_lost_penalty_db_per_pct      = 0.5f;
-	c->mcs.loss_recovered_penalty_db_per_pct = 0.0f;
-	c->mcs.loss_penalty_max_db               = 20.0f;
-	c->mcs.up_consecutive   = 3;
-	c->mcs.down_consecutive = 1;
-	c->mcs.up_cooldown_s    = 3.0f;
 	c->mcs.down_cooldown_s  = 0.2f;
-	c->mcs.failsafe_timeout_s            = 0.5f;
-	c->mcs.failsafe_recovery_consecutive = 3;
-	c->mcs.oscillation_window_s   = 5.0f;
-	c->mcs.oscillation_threshold  = 4;
-	c->mcs.oscillation_backoff    = 3.0f;
-	c->mcs.mcs_bucket_0 = 1;
-	c->mcs.mcs_bucket_1 = 2;
-	c->mcs.mcs_bucket_2 = 3;
+	c->mcs.failsafe_timeout_s   = 0.5f;
+	c->mcs.oscillation_window_s = 5.0f;
 	c->mcs.mcs_min = 0;
-	c->mcs.mcs_max = 11;
-	c->mcs.start_low = false;
+	c->mcs.mcs_max = 5;   /* video caps at 5; rungs 6,7 reserved for probing */
+	/* Transport backpressure coupling (anti death-spiral): on by default,
+	 * escape after 2 s of held pressure. Inert on links with no SHM sidecar
+	 * (in_pressure never asserts) and on the bench (RF clean, ring never
+	 * saturates) — only engages when a saturated ring meets good RF. */
+	c->mcs.pressure_demote_block = true;
+	c->mcs.pressure_escape_s     = 2.0f;
+	c->mcs.probe_clean_milli = 20;    /* <=2%  -> +2 clean -> promote        */
+	/* fail threshold 200‰ (not 100): with a 0.5 s GS window the rung
+	 * sample is ~accounted = pps/2 packets; at 100‰ a single lost packet
+	 * of 20 sat exactly on the threshold and a *marginal* (not failing)
+	 * V+2 rung caused a constant pre-empt-demote/promote bounce at the
+	 * ceiling (device-observed 2026-06-10, ~1 bounce/10 s). A real
+	 * approaching cliff reads 500-1000‰ within a window, so 200 keeps
+	 * the early-warning intact while reading "marginal" as hold. */
+	c->mcs.probe_fail_milli  = 200;   /* >=20% -> +2 fail  -> pre-empt demote*/
+	c->mcs.demote_per_milli  = 30;    /* >=3% live video PER -> reactive down*/
+	c->mcs.promote_dwell_s   = 0.5f;
+	c->mcs.probe_window_s    = 0.5f;
+	c->mcs.probe_stale_age_s = 1.0f; /* matches ~10 Hz single-stream freshness
+	                                  * (Phase 4; 1.5 was the swept prototype) */
+	/* Probe producer: runs whenever MCS is enabled, inert until S99wfb
+	 * passes --probe / --probe-feed (ports stay 0). 40 pps × 1400 B
+	 * ≈ 450 kbit/s of probe airtime at the V+2 rate — still negligible,
+	 * and it doubles the per-window PER resolution (~20 packets per
+	 * 0.5 s GS window → 50‰ granularity; 20 pps gave 10-packet windows
+	 * where one lost packet hit the old fail threshold exactly). */
+	c->mcs.probe_feed_pps    = 40;
+	c->mcs.probe_feed_bytes  = 1400;
+	/* RSSI guard-rails (rules 2/3). Defaults sized for typical wfb-ng
+	 * link budgets: floor -85 dBm is near the MCS0 sensitivity edge;
+	 * fade 10 dB/s armed below -65 dBm catches fast walk-away /
+	 * obstruction collapse while ignoring fades at strong signal. */
+	c->mcs.rssi_floor_dbm     = -85.0f;
+	c->mcs.rssi_fade_db_per_s = 10.0f;
+	c->mcs.rssi_fade_arm_dbm  = -65.0f;
+	/* 6 dB: must exceed the smoothed-RSSI noise amplitude (raw ±10 dB
+	 * flap -> ±4-5 dB after the 0.3 EWMA), or promotes resume on noise
+	 * peaks at the knife-edge. */
+	c->mcs.rssi_floor_hyst_db = 6.0f;
+	c->mcs.reentry_backoff_s  = 5.0f;
+	c->mcs.reentry_dwell_s    = 2.0f;
 
 	/* CSA: off until --csa-iface is set. */
 	c->csa.enabled = false;
@@ -4023,34 +4315,23 @@ static void config_defaults(Config *c)
  * Main loop
  * ───────────────────────────────────────────────────────────────────── */
 
+#ifndef LC_TEST_NO_MAIN
 int main(int argc, char **argv)
 {
 	Config cfg;
 	config_defaults(&cfg);
 
+	/* CLI = wiring/topology only (endpoints, ifaces, the
+	 * deployment-dependent failsafe + safe-startup bitrate). Everything
+	 * tunable lives in the /set registry — see /schema. */
 	enum {
 		OPT_WFB = 256, OPT_API_PORT, OPT_DRY_RUN,
 		/* fec */
-		OPT_NO_FEC, OPT_SIDECAR, OPT_VENC, OPT_WFB_STATS_PORT,
-		OPT_MTU, OPT_MINK, OPT_MAXK, OPT_PPF_DEADBAND,
-		OPT_K_HYST_UP, OPT_COOLDOWN_UP, OPT_K_DOWN_DWELL, OPT_K_UP_DWELL,
-		OPT_STARTUP_GRACE, OPT_SAFETY,
-		OPT_BITRATE_MIN, OPT_BITRATE_MAX, OPT_BITRATE_TOL, OPT_BITRATE_GRACE,
-		OPT_BITRATE_LEAD, OPT_MCS_SETTLE, OPT_BOOST_S, OPT_BOOST_MULT,
-		OPT_MAX_PAYLOAD,
-		OPT_NO_SAFE_STARTUP, OPT_SAFE_STARTUP_BITRATE, OPT_SAFE_STARTUP_PAYLOAD,
+		OPT_NO_FEC, OPT_SIDECAR, OPT_VENC, OPT_SAFE_STARTUP_BITRATE,
 		/* mcs */
-		OPT_NO_MCS, OPT_STATS, OPT_RANGE,
-		OPT_RSSI_LOW, OPT_RSSI_HIGH, OPT_DEADBAND,
-		OPT_RSSI_ALPHA, OPT_LOSS_ALPHA, OPT_AGGREGATOR,
-		OPT_LOSS_LOST_PCT, OPT_LOSS_RECOV_PCT, OPT_LOSS_CAP,
-		OPT_UP_CONSEC, OPT_DOWN_CONSEC, OPT_UP_COOLDOWN, OPT_DOWN_COOLDOWN,
-		OPT_FAILSAFE, OPT_RECOVER_CONSEC,
-		OPT_OSC_WINDOW, OPT_OSC_THRESHOLD, OPT_OSC_BACKOFF,
-		OPT_START_LOW,
+		OPT_NO_MCS, OPT_STATS, OPT_FAILSAFE, OPT_PROBE, OPT_PROBE_FEED,
 		/* csa */
-		OPT_CSA_IFACE, OPT_CSA_ALLOWLIST, OPT_CSA_BANDWIDTH,
-		OPT_CSA_COOLDOWN, OPT_CSA_NO_REVERT,
+		OPT_CSA_IFACE,
 		/* cmd */
 		OPT_WFB_IFACE,
 		/* system */
@@ -4063,56 +4344,13 @@ int main(int argc, char **argv)
 		{"no-fec",         no_argument,       0, OPT_NO_FEC},
 		{"sidecar",        required_argument, 0, OPT_SIDECAR},
 		{"venc",           required_argument, 0, OPT_VENC},
-		{"wfb-stats-port", required_argument, 0, OPT_WFB_STATS_PORT},
-		{"mtu",            required_argument, 0, OPT_MTU},
-		{"min-k",          required_argument, 0, OPT_MINK},
-		{"max-k",          required_argument, 0, OPT_MAXK},
-		{"ppf-deadband",   required_argument, 0, OPT_PPF_DEADBAND},
-		{"k-hyst-up",      required_argument, 0, OPT_K_HYST_UP},
-		{"cooldown-up",    required_argument, 0, OPT_COOLDOWN_UP},
-		{"k-down-dwell",   required_argument, 0, OPT_K_DOWN_DWELL},
-		{"k-up-dwell",     required_argument, 0, OPT_K_UP_DWELL},
-		{"startup-grace",  required_argument, 0, OPT_STARTUP_GRACE},
-		{"safety",         required_argument, 0, OPT_SAFETY},
-		{"bitrate-min",    required_argument, 0, OPT_BITRATE_MIN},
-		{"bitrate-max",    required_argument, 0, OPT_BITRATE_MAX},
-		{"bitrate-tol",    required_argument, 0, OPT_BITRATE_TOL},
-		{"bitrate-grace",  required_argument, 0, OPT_BITRATE_GRACE},
-		{"bitrate-lead-s", required_argument, 0, OPT_BITRATE_LEAD},
-		{"mcs-settle-s",   required_argument, 0, OPT_MCS_SETTLE},
-		{"boost-s",        required_argument, 0, OPT_BOOST_S},
-		{"boost-mult",     required_argument, 0, OPT_BOOST_MULT},
-		{"max-payload",    required_argument, 0, OPT_MAX_PAYLOAD},
-		{"no-safe-startup",      no_argument,       0, OPT_NO_SAFE_STARTUP},
 		{"safe-startup-bitrate", required_argument, 0, OPT_SAFE_STARTUP_BITRATE},
-		{"safe-startup-payload", required_argument, 0, OPT_SAFE_STARTUP_PAYLOAD},
 		{"no-mcs",         no_argument,       0, OPT_NO_MCS},
 		{"stats",          required_argument, 0, OPT_STATS},
-		{"range",          required_argument, 0, OPT_RANGE},
-		{"rssi-low",       required_argument, 0, OPT_RSSI_LOW},
-		{"rssi-high",      required_argument, 0, OPT_RSSI_HIGH},
-		{"deadband",       required_argument, 0, OPT_DEADBAND},
-		{"rssi-alpha",     required_argument, 0, OPT_RSSI_ALPHA},
-		{"loss-alpha",     required_argument, 0, OPT_LOSS_ALPHA},
-		{"aggregator",     required_argument, 0, OPT_AGGREGATOR},
-		{"loss-lost-pct",  required_argument, 0, OPT_LOSS_LOST_PCT},
-		{"loss-recov-pct", required_argument, 0, OPT_LOSS_RECOV_PCT},
-		{"loss-cap",       required_argument, 0, OPT_LOSS_CAP},
-		{"up-consec",      required_argument, 0, OPT_UP_CONSEC},
-		{"down-consec",    required_argument, 0, OPT_DOWN_CONSEC},
-		{"up-cooldown",    required_argument, 0, OPT_UP_COOLDOWN},
-		{"down-cooldown",  required_argument, 0, OPT_DOWN_COOLDOWN},
 		{"failsafe",       required_argument, 0, OPT_FAILSAFE},
-		{"recover-consec", required_argument, 0, OPT_RECOVER_CONSEC},
-		{"osc-window",     required_argument, 0, OPT_OSC_WINDOW},
-		{"osc-threshold",  required_argument, 0, OPT_OSC_THRESHOLD},
-		{"osc-backoff",    required_argument, 0, OPT_OSC_BACKOFF},
-		{"start-low",      no_argument,       0, OPT_START_LOW},
+		{"probe",          required_argument, 0, OPT_PROBE},
+		{"probe-feed",     required_argument, 0, OPT_PROBE_FEED},
 		{"csa-iface",      required_argument, 0, OPT_CSA_IFACE},
-		{"csa-allowlist",  required_argument, 0, OPT_CSA_ALLOWLIST},
-		{"csa-bandwidth",  required_argument, 0, OPT_CSA_BANDWIDTH},
-		{"csa-cooldown-ms",required_argument, 0, OPT_CSA_COOLDOWN},
-		{"csa-no-revert",  no_argument,       0, OPT_CSA_NO_REVERT},
 		{"wfb-iface",      required_argument, 0, OPT_WFB_IFACE},
 		{"iface-mtu",      required_argument, 0, OPT_IFACE_MTU},
 		{"verbose",        no_argument,       0, 'v'},
@@ -4120,7 +4358,6 @@ int main(int argc, char **argv)
 		{0, 0, 0, 0},
 	};
 
-	bool mtu_set_by_user = false;
 	int ch;
 	while ((ch = getopt_long(argc, argv, "vh", longopts, NULL)) != -1) {
 		switch (ch) {
@@ -4153,46 +4390,6 @@ int main(int argc, char **argv)
 				fprintf(stderr, "invalid --venc\n"); return 1;
 			}
 			break;
-		case OPT_WFB_STATS_PORT: {
-			int p = atoi(optarg);
-			if (p < 0 || p > 65535) {
-				fprintf(stderr, "invalid --wfb-stats-port\n"); return 1;
-			}
-			cfg.fec.wfb_stats_port = (uint16_t)p;
-			break;
-		}
-		case OPT_MTU:           cfg.fec.mtu              = atoi(optarg);
-		                        mtu_set_by_user = true; break;
-		case OPT_MINK:          cfg.fec.min_k            = atoi(optarg); break;
-		case OPT_MAXK:          cfg.fec.max_k            = atoi(optarg); break;
-		case OPT_PPF_DEADBAND:  cfg.fec.ppf_deadband_frac = (float)atof(optarg); break;
-		case OPT_K_HYST_UP:     cfg.fec.k_hyst_up        = atoi(optarg); break;
-		case OPT_COOLDOWN_UP:   cfg.fec.cooldown_up_s    = (float)atof(optarg); break;
-		case OPT_K_DOWN_DWELL:  cfg.fec.k_down_dwell_s   = (float)atof(optarg); break;
-		case OPT_K_UP_DWELL:    cfg.fec.k_up_dwell_s     = (float)atof(optarg); break;
-		case OPT_STARTUP_GRACE: cfg.fec.startup_grace_s  = (float)atof(optarg); break;
-		case OPT_SAFETY:        cfg.fec.safety_margin    = (float)atof(optarg); break;
-		case OPT_BITRATE_MIN:   cfg.fec.bitrate_min_kbps = atol(optarg); break;
-		case OPT_BITRATE_MAX:   cfg.fec.bitrate_max_kbps = atol(optarg); break;
-		case OPT_BITRATE_TOL:   cfg.fec.bitrate_tolerance = (float)atof(optarg); break;
-		case OPT_BITRATE_GRACE: cfg.fec.bitrate_grace_s   = (float)atof(optarg); break;
-		case OPT_BITRATE_LEAD:  cfg.fec.bitrate_lead_s   = (float)atof(optarg); break;
-		case OPT_MCS_SETTLE:    cfg.fec.mcs_settle_s     = (float)atof(optarg); break;
-		case OPT_BOOST_S:       cfg.fec.boost_s          = (float)atof(optarg); break;
-		case OPT_BOOST_MULT:    cfg.fec.boost_mult       = (float)atof(optarg); break;
-		case OPT_MAX_PAYLOAD: {
-			int p = atoi(optarg);
-			if (p < 576 || p > 4000) {
-				fprintf(stderr,
-				    "invalid --max-payload %d: must be in [576, 4000]\n", p);
-				return 1;
-			}
-			cfg.fec.payload_max = p;
-			break;
-		}
-		case OPT_NO_SAFE_STARTUP:
-			cfg.fec.safe_startup_enabled = false;
-			break;
 		case OPT_SAFE_STARTUP_BITRATE: {
 			long v = atol(optarg);
 			if (v < 100 || v > 100000) {
@@ -4203,69 +4400,29 @@ int main(int argc, char **argv)
 			cfg.fec.safe_startup_bitrate_kbps = v;
 			break;
 		}
-		case OPT_SAFE_STARTUP_PAYLOAD: {
-			int p = atoi(optarg);
-			if (p < 576 || p > 4000) {
-				fprintf(stderr,
-				    "invalid --safe-startup-payload %d: must be in [576, 4000]\n", p);
-				return 1;
-			}
-			cfg.fec.safe_startup_payload = p;
-			break;
-		}
 		case OPT_STATS:
 			if (parse_hostport(optarg, cfg.mcs.stats_host,
 			                   sizeof(cfg.mcs.stats_host), &cfg.mcs.stats_port) != 0) {
 				fprintf(stderr, "invalid --stats\n"); return 1;
 			}
 			break;
-		case OPT_RANGE:
-			if (parse_range_preset(optarg, &cfg) != 0) {
-				fprintf(stderr, "invalid --range (low|med|high)\n");
-				return 1;
-			}
-			break;
-		case OPT_RSSI_LOW:       cfg.mcs.rssi_thresh_low  = (float)atof(optarg); break;
-		case OPT_RSSI_HIGH:      cfg.mcs.rssi_thresh_high = (float)atof(optarg); break;
-		case OPT_DEADBAND:       cfg.mcs.rssi_deadband_db = (float)atof(optarg); break;
-		case OPT_RSSI_ALPHA:     cfg.mcs.rssi_ewma_alpha  = (float)atof(optarg); break;
-		case OPT_LOSS_ALPHA:     cfg.mcs.loss_ewma_alpha  = (float)atof(optarg); break;
-		case OPT_AGGREGATOR: {
-			int a = parse_aggregator(optarg);
-			if (a < 0) {
-				fprintf(stderr, "invalid --aggregator\n"); return 1;
-			}
-			cfg.mcs.rssi_aggregator = a;
-			break;
-		}
-		case OPT_LOSS_LOST_PCT:  cfg.mcs.loss_lost_penalty_db_per_pct      = (float)atof(optarg); break;
-		case OPT_LOSS_RECOV_PCT: cfg.mcs.loss_recovered_penalty_db_per_pct = (float)atof(optarg); break;
-		case OPT_LOSS_CAP:       cfg.mcs.loss_penalty_max_db               = (float)atof(optarg); break;
-		case OPT_UP_CONSEC:      cfg.mcs.up_consecutive   = atoi(optarg); break;
-		case OPT_DOWN_CONSEC:    cfg.mcs.down_consecutive = atoi(optarg); break;
-		case OPT_UP_COOLDOWN:    cfg.mcs.up_cooldown_s    = (float)atof(optarg); break;
-		case OPT_DOWN_COOLDOWN:  cfg.mcs.down_cooldown_s  = (float)atof(optarg); break;
 		case OPT_FAILSAFE:       cfg.mcs.failsafe_timeout_s = (float)atof(optarg); break;
-		case OPT_RECOVER_CONSEC: cfg.mcs.failsafe_recovery_consecutive = atoi(optarg); break;
-		case OPT_OSC_WINDOW:     cfg.mcs.oscillation_window_s   = (float)atof(optarg); break;
-		case OPT_OSC_THRESHOLD:  cfg.mcs.oscillation_threshold  = atoi(optarg); break;
-		case OPT_OSC_BACKOFF:    cfg.mcs.oscillation_backoff    = (float)atof(optarg); break;
-		case OPT_START_LOW:      cfg.mcs.start_low = true; break;
+		case OPT_PROBE:
+			if (parse_hostport(optarg, cfg.probe_host,
+			                   sizeof(cfg.probe_host), &cfg.probe_port) != 0) {
+				fprintf(stderr, "invalid --probe\n"); return 1;
+			}
+			break;
+		case OPT_PROBE_FEED:
+			if (parse_hostport(optarg, cfg.probe_feed_host,
+			                   sizeof(cfg.probe_feed_host),
+			                   &cfg.probe_feed_port) != 0) {
+				fprintf(stderr, "invalid --probe-feed\n"); return 1;
+			}
+			break;
 		case OPT_CSA_IFACE:
 			snprintf(cfg.csa.iface, sizeof(cfg.csa.iface), "%s", optarg);
 			cfg.csa.enabled = true;
-			break;
-		case OPT_CSA_ALLOWLIST:
-			snprintf(cfg.csa.allow_chan, sizeof(cfg.csa.allow_chan), "%s", optarg);
-			break;
-		case OPT_CSA_BANDWIDTH:
-			snprintf(cfg.csa.allow_bw, sizeof(cfg.csa.allow_bw), "%s", optarg);
-			break;
-		case OPT_CSA_COOLDOWN:
-			cfg.csa.cooldown_ms = strtoll(optarg, NULL, 10);
-			break;
-		case OPT_CSA_NO_REVERT:
-			cfg.csa.no_revert = true;
 			break;
 		case OPT_WFB_IFACE:
 			snprintf(cfg.cmd.wfb_iface, sizeof(cfg.cmd.wfb_iface),
@@ -4286,27 +4443,12 @@ int main(int argc, char **argv)
 		}
 	}
 
-	/* When adaptive payload is enabled and the operator did not pin
-	 * --mtu themselves, default fec.mtu (the FEC k-sizing budget) to
-	 * the payload ceiling. wfb_tx will fragment frames at the venc
-	 * payload boundary, so an mtu lower than the actual emit size makes
-	 * k overshoot. This is a startup-only tie; live operator changes to
-	 * fec.payload_min that produce a smaller selected payload do not
-	 * walk fec.mtu back — that's a follow-up wiring item. */
-	if (cfg.fec.payload_max > 0 && !mtu_set_by_user) {
-		cfg.fec.mtu = cfg.fec.payload_max;
-	}
-	if (cfg.fec.payload_max > 0 && cfg.fec.payload_min > cfg.fec.payload_max) {
-		fprintf(stderr,
-		    "fec.payload_min (%d) > --max-payload (%d)\n",
-		    cfg.fec.payload_min, cfg.fec.payload_max);
-		return 1;
-	}
-
-	if (cfg.mcs.enabled &&
-	    cfg.mcs.rssi_thresh_low >= cfg.mcs.rssi_thresh_high) {
-		fprintf(stderr, "rssi_thresh_low (%.1f) must be < rssi_thresh_high (%.1f)\n",
-		        (double)cfg.mcs.rssi_thresh_low, (double)cfg.mcs.rssi_thresh_high);
+	/* The unified MCS law promotes on probe data only — without a probe
+	 * producer it would pin video at mcs_min forever. Make the
+	 * dependency explicit instead of degrading silently. */
+	if (cfg.mcs.enabled && cfg.probe_port == 0) {
+		fprintf(stderr, "MCS adaptation requires the V+2 probe producer "
+		                "(--probe HOST:PORT); pass --no-mcs for FEC-only\n");
 		return 1;
 	}
 	if (!cfg.fec.enabled && !cfg.mcs.enabled && !cfg.csa.enabled) {
@@ -4328,6 +4470,11 @@ int main(int argc, char **argv)
 	    cfg.wfb_host, cfg.wfb_port, cfg.api_port, cfg.dry_run ? 1 : 0,
 	    cfg.fec.enabled ? "on" : "off",
 	    cfg.mcs.enabled ? "on" : "off");
+	if (cfg.probe_port != 0)
+		LOG_MCS("probe producer: ctrl=%s:%u feed=%s:%u pps=%d bytes=%d",
+		    cfg.probe_host, (unsigned)cfg.probe_port,
+		    cfg.probe_feed_host, (unsigned)cfg.probe_feed_port,
+		    cfg.mcs.probe_feed_pps, cfg.mcs.probe_feed_bytes);
 
 	/* Apply --iface-mtu to each unique iface in {csa.iface, cmd.wfb_iface}
 	 * before any subsystem opens its sockets. Skipped under --dry-run so a
@@ -4368,15 +4515,17 @@ int main(int argc, char **argv)
 			    cfg.fec.payload_max, cfg.fec.payload_min,
 			    cfg.fec.payload_max > 1472 ? " (assumes jumbo path)" : "");
 		} else {
-			LOG_FEC("payload sizing: off (pass --max-payload N to enable)");
+			LOG_FEC("payload sizing: off");
 		}
 	}
 	if (cfg.mcs.enabled) {
-		LOG_MCS("subsys: stats=%s:%u range=(%d,%d,%d) thresh=(%.1f/%.1f)±%.1f",
+		LOG_MCS("subsys: stats=%s:%u clamp=[%d,%d] "
+		        "guard: floor=%.1fdBm fade=%.1fdB/s(arm<=%.1fdBm)",
 		    cfg.mcs.stats_host, cfg.mcs.stats_port,
-		    cfg.mcs.mcs_bucket_0, cfg.mcs.mcs_bucket_1, cfg.mcs.mcs_bucket_2,
-		    (double)cfg.mcs.rssi_thresh_low, (double)cfg.mcs.rssi_thresh_high,
-		    (double)cfg.mcs.rssi_deadband_db);
+		    cfg.mcs.mcs_min, cfg.mcs.mcs_max,
+		    (double)cfg.mcs.rssi_floor_dbm,
+		    (double)cfg.mcs.rssi_fade_db_per_s,
+		    (double)cfg.mcs.rssi_fade_arm_dbm);
 	}
 	(void)cfg_validate_warnings(&cfg);
 
@@ -4496,10 +4645,6 @@ int main(int argc, char **argv)
 		}
 	}
 
-	/* --start-low is moved BELOW safe-startup so the bitrate is already
-	 * safe before the boot-time MCS drop. Otherwise the inherited high
-	 * bitrate would briefly outrun the new lower MCS. */
-
 	/* ── HTTP API ── */
 
 	int api_fd = -1;
@@ -4562,15 +4707,38 @@ int main(int argc, char **argv)
 
 	Selector sel;
 	selector_init(&sel);
+	/* Boot-arm the failsafe watchdog: with the GS absent at boot nothing
+	 * ever feeds the selector, and video would sit at the static S99wfb
+	 * MCS forever instead of the most robust rung. Pretend a datagram at
+	 * boot so the watchdog forces mcs_min after failsafe_timeout_s
+	 * ("GS absent => max robustness"); the first real datagram clears
+	 * failsafe and the probe law climbs rung-by-rung as usual. */
+	sel.last_datagram_us = now_us();
 	Scorer scorer;
 	scorer_reset(&scorer);
-	float    last_eff_rssi    = 0.0f;
+	ProbeState probe;
+	probe_state_init(&probe);
+	/* Probe producer: paced PRB feeder + V+2 retune reconciler.
+	 * Inert until --probe / --probe-feed configure the endpoints. Both
+	 * run as deadline ticks in the single poll() loop — no thread. */
+	int       probe_feed_fd      = -1;
+	uint32_t  probe_feed_seq     = 0;
+	uint64_t  next_probe_feed_us = 0;
+	int       probe_tuned_mcs    = -1;   /* last MCS acked by probe wfb_tx */
+	RadioBody probe_sent_body;           /* last body acked by probe wfb_tx */
+	bool      probe_sent_valid   = false;
+	uint64_t  probe_retry_us     = 0;    /* retune failure backoff          */
+	uint32_t  probe_retune_fails = 0;
+	int       probe_sf_state     = 0;    /* retune failing (log-once latch) */
+	int       probe_gate_mcs     = -2;   /* commit-change detector          */
+	memset(&probe_sent_body, 0, sizeof(probe_sent_body));
+	float    last_raw_rssi    = 0.0f;
 	float    last_smooth_rssi = 0.0f;
 	float    last_lost_ratio  = 0.0f;
 	float    last_recov_ratio = 0.0f;
 	float    last_diversity_ratio = 0.0f;
 	int      last_adapter_count = -1;
-	float    last_loss_pen_db = 0.0f;
+	float    last_rssi_slope  = 0.0f;
 	int      last_emit_mcs    = -1;
 	int      last_ant_count   = 0;
 	float    last_ant_avg[ANT_MAX] = {0};
@@ -4618,27 +4786,6 @@ int main(int argc, char **argv)
 		}
 	} else if (cfg.fec.enabled && !cfg.fec.safe_startup_enabled) {
 		LOG_FEC("safe-startup: disabled (--no-safe-startup) — venc state inherited as-is");
-	}
-
-	/* Optional --start-low boot SET, deferred until after safe-startup so
-	 * the bitrate is already at the floor before the radio drops. The FEC
-	 * controller has no `have_current` yet, so the helper's pre-drop
-	 * bitrate write is a no-op — safe-startup covers that responsibility
-	 * here. We use the helper anyway for ordering consistency. */
-	if (cfg.mcs.enabled && cfg.mcs.start_low &&
-	    radio_body_valid && !cfg.dry_run) {
-		int target_mcs = mcs_for_bucket(0, &cfg);
-		if (radio_body.mcs_index != target_mcs) {
-			RadioBody r = radio_body;
-			r.mcs_index = (uint8_t)target_mcs;
-			if (wfb_set_radio(&cfg, &r) == 0) {
-				radio_body = r;
-				LOG_MCS("startup: forced mcs=%d (range[0]) per --start-low",
-				    target_mcs);
-			} else {
-				LOG_MCS("startup: --start-low SET failed");
-			}
-		}
 	}
 
 	/* ── Timers ── */
@@ -4695,6 +4842,105 @@ int main(int argc, char **argv)
 			}
 		}
 
+		/* --- Probe producer tick ---
+		 *
+		 * (a) Commit gate: stamp probe.gate_us whenever the committed
+		 *     video MCS moves, so the control law never acts on a probe
+		 *     record measured before the commit (§5.1 retune-ordering
+		 *     invariant). Detected here (not in selector_commit) so
+		 *     EVERY commit path is covered: probe law, failsafe, clamp,
+		 *     realign, WCMD operator writes.
+		 * (b) Retune reconciler: keep the probe wfb_tx at
+		 *     min(current_mcs + 2, 7), mirroring the video PHY
+		 *     (bw/stbc/ldpc/sgi/vht). Reconciles on any drift — MCS
+		 *     commits AND video PHY changes (e.g. a WCMD bandwidth
+		 *     write) — with a 1 s backoff while the probe wfb_tx is
+		 *     unreachable so a missing probe can't stall the loop.
+		 * (c) Paced PRB feeder at mcs.probe_feed_pps to the probe
+		 *     wfb_tx udp input. Best-effort connected-UDP sends;
+		 *     errors (probe down) are silently dropped. */
+		bool probe_on = cfg.mcs.enabled && !cfg.dry_run;
+		if (sel.current_mcs != probe_gate_mcs) {
+			probe.gate_us = now;
+			probe_gate_mcs = sel.current_mcs;
+		}
+		if (probe_on && cfg.probe_port != 0 && sel.current_mcs >= 0 &&
+		    now >= probe_retry_us) {
+			int desired = sel.current_mcs + 2;
+			if (desired > 7) desired = 7;   /* 1SS headroom clamp (§5.2) */
+			RadioBody want;
+			if (radio_body_valid) {
+				want = radio_body;
+			} else {
+				/* Video PHY not synced yet — canonical defaults
+				 * (B20 S1 L1, long GI, HT). */
+				memset(&want, 0, sizeof(want));
+				want.stbc = 1; want.ldpc = 1; want.short_gi = 0;
+				want.bandwidth = 20; want.vht_mode = 0; want.vht_nss = 1;
+			}
+			want.mcs_index = (uint8_t)desired;
+			if (!probe_sent_valid ||
+			    memcmp(&want, &probe_sent_body, sizeof(want)) != 0) {
+				if (wfb_set_radio_at(cfg.probe_host, cfg.probe_port,
+				                     &want) == 0) {
+					probe_sent_body  = want;
+					probe_sent_valid = true;
+					probe_tuned_mcs  = desired;
+					if (probe_sf_state) {
+						LOG_MCS("probe: retune recovered (mcs=%d)",
+						    desired);
+						probe_sf_state = 0;
+					}
+					LOG_MCS("probe: retuned probe wfb_tx to mcs=%d (video=%d)",
+					    desired, sel.current_mcs);
+				} else {
+					probe_retune_fails++;
+					if (!probe_sf_state) {
+						LOG_MCS("probe: SET_RADIO %s:%u failed — retrying every 1s",
+						    cfg.probe_host, (unsigned)cfg.probe_port);
+						probe_sf_state = 1;
+					}
+					probe_retry_us = now + 1000000ULL;
+				}
+			}
+		}
+		if (probe_on && cfg.probe_feed_port != 0 &&
+		    cfg.mcs.probe_feed_pps > 0 && now >= next_probe_feed_us) {
+			if (probe_feed_fd < 0) {
+				struct sockaddr_in fa;
+				if (resolve_ipv4(cfg.probe_feed_host,
+				                 cfg.probe_feed_port, &fa) == 0) {
+					probe_feed_fd = socket(AF_INET,
+					    SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+					if (probe_feed_fd >= 0 &&
+					    connect(probe_feed_fd, (struct sockaddr*)&fa,
+					            sizeof(fa)) != 0) {
+						close(probe_feed_fd);
+						probe_feed_fd = -1;
+					}
+				}
+			}
+			if (probe_feed_fd >= 0) {
+				/* "PRB" + 10-digit seq + 'x' padding — same shape as
+				 * the validated shell-feeder prototype. */
+				char pkt[1472];
+				int len = cfg.mcs.probe_feed_bytes;
+				if (len < 64) len = 64;
+				if (len > (int)sizeof(pkt)) len = (int)sizeof(pkt);
+				int hdr = snprintf(pkt, sizeof(pkt), "PRB%010u",
+				                   probe_feed_seq);
+				memset(pkt + hdr, 'x', (size_t)len - (size_t)hdr);
+				(void)send(probe_feed_fd, pkt, (size_t)len, 0);
+				probe_feed_seq++;
+			}
+			uint64_t iv = 1000000ULL /
+			    (uint64_t)cfg.mcs.probe_feed_pps;
+			/* Fixed-cadence schedule; resync (not burst) after a stall. */
+			next_probe_feed_us = (next_probe_feed_us == 0 ||
+			                      next_probe_feed_us + iv < now)
+			    ? now + iv : next_probe_feed_us + iv;
+		}
+
 		/* --- FEC sidecar SUBSCRIBE keepalive ---
 		 * Pure datagram-level keepalive: venc treats us as subscribed
 		 * for ~5 s after each SUBSCRIBE arrives. The per-tick log used
@@ -4745,21 +4991,23 @@ int main(int argc, char **argv)
 				    divergence);
 			}
 			if (cfg.mcs.enabled) {
-				if (sel.current_bucket >= 0) {
+				if (sel.current_mcs >= 0) {
 					char divergence[32] = "";
-					if (radio_body_valid && sel.current_mcs >= 0 &&
+					if (radio_body_valid &&
 					    radio_body.mcs_index != (uint8_t)sel.current_mcs) {
 						snprintf(divergence, sizeof(divergence),
 						         " WFB_MCS=%d!", radio_body.mcs_index);
 					}
-					LOG_MCS("hb: bucket=%d mcs=%d eff=%.1f lost=%.2f%% recov=%.1f%% pen=%.1fdB commits=%u%s%s",
-					    sel.current_bucket, sel.current_mcs,
-					    (double)last_eff_rssi,
+					LOG_MCS("hb: mcs=%d rssi=%.1f slope=%.1f lost=%.2f%% recov=%.1f%% commits=%u%s%s%s%s",
+					    sel.current_mcs,
+					    (double)last_smooth_rssi,
+					    (double)last_rssi_slope,
 					    (double)(last_lost_ratio * 100.0f),
 					    (double)(last_recov_ratio * 100.0f),
-					    (double)last_loss_pen_db,
 					    sel.commit_count,
 					    sel.in_failsafe ? " FAILSAFE" : "",
+					    sel.rssi_floor_active ? " FLOOR" : "",
+					    sel.rssi_fade_active ? " FADE" : "",
 					    divergence);
 				} else {
 					LOG_MCS("hb: waiting for rx_ant on udp:%u (no datagram yet, %.1fs since boot)",
@@ -4772,8 +5020,40 @@ int main(int argc, char **argv)
 		/* --- MCS watchdog tick --- */
 		if (cfg.mcs.enabled && now >= next_watchdog_us) {
 			int new_mcs = -1;
-			SelectDecision sd = selector_tick_no_data(&sel, &cfg, now, &new_mcs);
-			if (sd == SD_FAILSAFE && radio_body_valid && !cfg.dry_run) {
+			SelectDecision sd = SD_NONE;
+			/* Live /set of mcs.mcs_min/mcs_max under a committed MCS:
+			 * nothing in the law re-clamps at steady hold (promotes are
+			 * bounded, demotes need a trigger) — do it here. */
+			if (sel.current_mcs >= 0 &&
+			    (sel.current_mcs < cfg.mcs.mcs_min ||
+			     sel.current_mcs > cfg.mcs.mcs_max)) {
+				SelectDecision dir = sel.current_mcs > cfg.mcs.mcs_max
+				    ? SD_DOWN : SD_UP;
+				LOG_MCS("clamp: committed mcs=%d outside [%d,%d] after live /set — re-clamping",
+				    sel.current_mcs, cfg.mcs.mcs_min, cfg.mcs.mcs_max);
+				sd = selector_commit(&sel, &cfg, sel.current_mcs, now,
+				                     dir, &new_mcs);
+			}
+			if (sd == SD_NONE)
+				sd = selector_tick_no_data(&sel, &cfg, now, &new_mcs);
+			/* Boot-failsafe corner: the watchdog can fire before any
+			 * rx_ant datagram ever synced the radio cache (GS absent
+			 * at boot). wfb_tx is local — sync now so the mcs_min SET
+			 * below actually goes out; otherwise the commit would stay
+			 * selector-only until the first datagram's realign, which
+			 * never comes while the GS is away. */
+			if (sd != SD_NONE && !radio_body_valid && !cfg.dry_run) {
+				RadioBody fresh;
+				if (wfb_get_radio(&cfg, &fresh) == 0) {
+					radio_body = fresh;
+					radio_body_valid = true;
+					LOG_MCS("wfb_tx radio sync (watchdog): bw=%d sgi=%d stbc=%d ldpc=%d mcs=%d vht=%d nss=%d",
+					    fresh.bandwidth, fresh.short_gi, fresh.stbc,
+					    fresh.ldpc, fresh.mcs_index, fresh.vht_mode,
+					    fresh.vht_nss);
+				}
+			}
+			if (sd != SD_NONE && radio_body_valid && !cfg.dry_run) {
 				int rc = commit_mcs_change(&cfg, &pending_drop,
 				    &radio_body, new_mcs, &radio, &fec_ctrl,
 				    &last_written_kbps, &last_written_payload, now);
@@ -4796,17 +5076,17 @@ int main(int argc, char **argv)
 				} else if (rc == 1) {
 					/* Deferred drop armed; pending tick will fire SET_RADIO. */
 				} else {
-					/* DELIBERATELY do NOT undo here. Stay in failsafe and
-					 * let the realign retry on the next datagram. */
+					/* DELIBERATELY do NOT undo here. The selector commit
+					 * stands; the realign retries on the next datagram. */
 					if (!mcs_sf_state || mcs_sf_target_mcs != new_mcs) {
-						LOG_MCS("failsafe: SET_RADIO send failed (mcs=%d, wfb_tx still %d) — staying failsafed, retrying on next datagram",
+						LOG_MCS("watchdog: SET_RADIO send failed (mcs=%d, wfb_tx still %d) — retrying on next datagram",
 						    new_mcs, radio_body.mcs_index);
 						mcs_sf_state = 1;
 						mcs_sf_first_us = now;
 						mcs_sf_target_mcs = new_mcs;
 					}
 				}
-			} else if (sd == SD_FAILSAFE) {
+			} else if (sd != SD_NONE) {
 				last_emit_mcs = new_mcs;
 			}
 			float period_s = cfg.mcs.failsafe_timeout_s / 4.0f;
@@ -4909,6 +5189,9 @@ int main(int argc, char **argv)
 			deadline = pending_drop.deadline_us;
 		if (csa_next_us > 0 && csa_next_us < deadline)
 			deadline = csa_next_us;
+		if (probe_on && cfg.probe_feed_port != 0 &&
+		    next_probe_feed_us > 0 && next_probe_feed_us < deadline)
+			deadline = next_probe_feed_us;
 		int timeout_ms = 100;
 		if (deadline > now) {
 			uint64_t ahead_ms = (deadline - now) / 1000ULL;
@@ -4947,13 +5230,13 @@ int main(int argc, char **argv)
 				.last_written_payload = last_written_payload,
 				.last_stats_us      = last_stats_us,
 				.last_rx_ant_us     = last_rx_ant_us,
-				.last_eff_rssi       = last_eff_rssi,
+				.last_raw_rssi       = last_raw_rssi,
 				.last_smoothed_rssi  = last_smooth_rssi,
 				.last_lost_ratio     = last_lost_ratio,
 				.last_recov_ratio    = last_recov_ratio,
 				.last_diversity_ratio = last_diversity_ratio,
 				.last_adapter_count  = last_adapter_count,
-				.last_loss_penalty_db = last_loss_pen_db,
+				.last_rssi_slope_db_s = last_rssi_slope,
 				.last_emit_mcs       = last_emit_mcs,
 				.ant_count           = last_ant_count,
 				.tr_present              = last_transport_present,
@@ -4973,6 +5256,11 @@ int main(int argc, char **argv)
 				            : 0)
 				    : 0,
 				.wcmd = &wcmd_state,
+				.probe = &probe,
+				.probe_configured = cfg.probe_port != 0,
+				.probe_feed_seq = probe_feed_seq,
+				.probe_tuned_mcs = probe_tuned_mcs,
+				.probe_retune_fails = probe_retune_fails,
 			};
 			memcpy(snap.ant_avg, last_ant_avg, sizeof(snap.ant_avg));
 			for (int i = 0; i < API_MAX_CLIENTS; i++) {
@@ -5093,6 +5381,55 @@ int main(int argc, char **argv)
 						(void)sendto(rx_ant_fd, &resp, sizeof(resp), 0,
 						             (const struct sockaddr *)&peer,
 						             sizeof(peer));
+						/* Operator radio write-through: adopt the body
+						 * the dispatch just SET on wfb_tx into our cache
+						 * so the realign / probe PHY mirror / future
+						 * commit bodies all see it (instead of silently
+						 * reverting it from a stale cache). */
+						if (wcmd_state.radio_written) {
+							wcmd_state.radio_written = false;
+							RadioBody wb = wcmd_state.radio_written_body;
+							radio_body = wb;
+							radio_body_valid = true;
+							if (pending_drop.active) {
+								/* A deferred MCS-down is in flight: keep
+								 * its target MCS (adaptive law wins the
+								 * MCS field) but carry the operator's
+								 * other PHY fields into the pending SET
+								 * so they survive the deferred write. */
+								uint8_t m = pending_drop.pending_radio.mcs_index;
+								pending_drop.pending_radio = wb;
+								pending_drop.pending_radio.mcs_index = m;
+							}
+							bool covered_by_pending =
+							    pending_drop.active &&
+							    pending_drop.target_mcs == sel.current_mcs;
+							if (cfg.mcs.enabled && sel.current_mcs >= 0 &&
+							    !covered_by_pending &&
+							    (int)wb.mcs_index != sel.current_mcs) {
+								/* MCS key: adopt into the selector — the
+								 * law continues from the operator's rung.
+								 * selector_commit clamps to [mcs_min,
+								 * mcs_max]; if the operator wrote outside
+								 * the clamp, the realign pulls wfb_tx
+								 * back on the next datagram. */
+								int adopted = -1;
+								SelectDecision dir =
+								    (int)wb.mcs_index > sel.current_mcs
+								    ? SD_UP : SD_DOWN;
+								(void)selector_commit(&sel, &cfg,
+								    (int)wb.mcs_index, now_us(), dir,
+								    &adopted);
+								last_emit_mcs = adopted;
+								LOG_MCS("wcmd: operator radio write adopted (mcs=%d, sel=%d)",
+								    wb.mcs_index, adopted);
+							}
+							radio_apply_observation(&radio, &fec_ctrl,
+							    &cfg, wb.mcs_index, wb.bandwidth,
+							    wb.short_gi, wb.stbc, wb.ldpc,
+							    wb.vht_mode, wb.vht_nss,
+							    now_us(), true);
+						}
 						if (cfg.verbose >= 1) {
 							char ip[INET_ADDRSTRLEN];
 							inet_ntop(AF_INET, &peer.sin_addr, ip,
@@ -5118,6 +5455,36 @@ int main(int argc, char **argv)
 						continue;
 					}
 					csa_link_alive(&csa_st, now_ms_csa);
+				}
+
+				/* Boundary-probe PER ingest. probe_log.py emits flat
+				 * records: {"type":"probe","mcs":M,"lost":L,
+				 * "accounted":A,...}. PER is derived from the integer
+				 * counters (no float parse). Phase 1: record only —
+				 * the control law does not consume these yet. */
+				if (strstr(dgram, "\"type\":\"probe\"")) {
+					long p_mcs = -1, p_acc = -1, p_lost = 0, p_ts = -1;
+					(void)json_get_int(dgram, "mcs",       &p_mcs);
+					(void)json_get_int(dgram, "accounted", &p_acc);
+					(void)json_get_int(dgram, "lost",      &p_lost);
+					(void)json_get_int(dgram, "ts_ms",     &p_ts);
+					if (p_mcs >= 0 && p_mcs < PROBE_MCS_MAX) {
+						ProbeRung *r = &probe.rung[p_mcs];
+						r->accounted = p_acc;
+						r->lost      = p_lost;
+						r->per_milli = (p_acc > 0)
+						    ? (int)((p_lost * 1000 + p_acc / 2) / p_acc)
+						    : -1;
+						r->last_us   = now_us();
+						r->ts_ms     = (p_ts >= 0) ? (uint64_t)p_ts : 0;
+						r->records++;
+						r->valid     = true;
+						probe.last_any_us = r->last_us;
+						probe.total_records++;
+					} else {
+						probe.parse_errors++;
+					}
+					continue;
 				}
 
 				if (!strstr(dgram, "\"type\":\"rx_ant\"")) continue;
@@ -5152,33 +5519,37 @@ int main(int argc, char **argv)
 				int adapters_seen = (pkt_adapters >= 0) ? (int)pkt_adapters : -1;
 
 				Score score;
+				uint64_t rx_now = now_us();
 				if (!scorer_update(&scorer, &cfg, dgram,
 				                   pkt_uniq, pkt_lost, pkt_fec_recovered,
 				                   pkt_diversity, adapters_seen,
-				                   &score))
+				                   rx_now, &score))
 					continue;
 
-				last_rx_ant_us   = now_us();
-				last_eff_rssi    = score.effective_rssi;
+				last_rx_ant_us   = rx_now;
+				last_raw_rssi    = score.raw_rssi;
 				last_smooth_rssi = score.smoothed_rssi;
 				last_lost_ratio  = score.smoothed_lost_ratio;
 				last_recov_ratio = score.smoothed_recov_ratio;
 				last_diversity_ratio = score.smoothed_diversity_ratio;
 				last_adapter_count = score.adapter_count;
-				last_loss_pen_db = score.loss_penalty_db;
+				last_rssi_slope  = score.rssi_slope_db_s;
 				last_ant_count   = score.ant_count;
 				memcpy(last_ant_avg, score.ant_avg, sizeof(last_ant_avg));
 
 				int new_mcs = -1;
 				Selector sel_snap = sel;
-				SelectDecision sd =
-				    selector_update(&sel, &cfg, &score, last_rx_ant_us, &new_mcs);
+				SelectDecision sd = selector_update(&sel, &cfg, &score,
+				                                    &probe,
+				                                    last_transport_in_pressure != 0,
+				                                    last_rx_ant_us,
+				                                    &new_mcs);
 				if (sd == SD_NONE) {
-					/* Realign block — bucket→mcs mapping changed under us
-					 * (operator /set, or external party touched wfb_tx). */
-					if (sel.current_bucket >= 0 && radio_body_valid &&
+					/* Realign block — an external party touched wfb_tx
+					 * (or an operator /set moved the clamp under us). */
+					if (sel.current_mcs >= 0 && radio_body_valid &&
 					    !cfg.dry_run) {
-						int want = mcs_for_bucket(sel.current_bucket, &cfg);
+						int want = sel.current_mcs;
 						/* If a deferred drop already targets this mcs, let
 						 * the pending tick handle it — avoid issuing a
 						 * duplicate SET_RADIO. */
@@ -5188,8 +5559,8 @@ int main(int argc, char **argv)
 						if (want != (int)radio_body.mcs_index &&
 						    !covered_by_pending) {
 							if (!mcs_sf_state || mcs_sf_target_mcs != want) {
-								LOG_MCS("realign: bucket=%d want_mcs=%d wfb_mcs=%d",
-								    sel.current_bucket, want, radio_body.mcs_index);
+								LOG_MCS("realign: want_mcs=%d wfb_mcs=%d",
+								    want, radio_body.mcs_index);
 							}
 							int rc = commit_mcs_change(&cfg, &pending_drop,
 							    &radio_body, want, &radio, &fec_ctrl,
@@ -5213,13 +5584,9 @@ int main(int argc, char **argv)
 									mcs_sf_state = 0;
 								}
 							} else if (rc == 1) {
-								/* Deferred drop. The selector's bucket
-								 * mapping needs to reflect the target so
-								 * subsequent decisions stay coherent;
-								 * sel.current_mcs is updated here even
-								 * though radio_body waits for the
-								 * pending tick. */
-								sel.current_mcs = want;
+								/* Deferred drop — radio_body waits for
+								 * the pending tick; sel.current_mcs
+								 * already equals the target. */
 							} else {
 								if (!mcs_sf_state || mcs_sf_target_mcs != want) {
 									LOG_MCS("realign: SET_RADIO failed (mcs=%d) — retrying silently until recovery",
@@ -5234,15 +5601,15 @@ int main(int argc, char **argv)
 					continue;
 				}
 
-				LOG_MCS("decision: %s bucket=%d mcs=%d eff=%.1f smooth=%.1f raw=%.1f lost=%.2f%% recov=%.1f%% pen=%.1fdB%s",
-				    sd_name(sd), sel.current_bucket, sel.current_mcs,
-				    (double)score.effective_rssi,
+				LOG_MCS("decision: %s mcs=%d smooth=%.1f raw=%.1f slope=%.1f lost=%.2f%% recov=%.1f%%%s%s",
+				    sd_name(sd), sel.current_mcs,
 				    (double)score.smoothed_rssi,
 				    (double)score.raw_rssi,
+				    (double)score.rssi_slope_db_s,
 				    (double)(score.smoothed_lost_ratio * 100.0f),
 				    (double)(score.smoothed_recov_ratio * 100.0f),
-				    (double)score.loss_penalty_db,
-				    selector_is_oscillating(&sel, &cfg) ? " [osc]" : "");
+				    sel.rssi_floor_active ? " [floor]" : "",
+				    sel.rssi_fade_active ? " [fade]" : "");
 
 				if (cfg.dry_run) {
 					last_emit_mcs = new_mcs;
@@ -5416,6 +5783,7 @@ int main(int argc, char **argv)
 	if (sidecar_fd >= 0) close(sidecar_fd);
 	if (wfb_stats_fd >= 0) close(wfb_stats_fd);
 	if (rx_ant_fd >= 0) close(rx_ant_fd);
+	if (probe_feed_fd >= 0) close(probe_feed_fd);
 	if (api_fd >= 0) close(api_fd);
 	g_api_clients = NULL;
 	for (int i = 0; i < API_MAX_CLIENTS; i++)
@@ -5424,3 +5792,4 @@ int main(int argc, char **argv)
 	    fec_ctrl.update_count, sel.commit_count);
 	return 0;
 }
+#endif /* LC_TEST_NO_MAIN */

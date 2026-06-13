@@ -95,6 +95,14 @@ GS:     [wfb_rx port 0  -> video, never touched]
   MCS** so the probe isolates the MCS variable.
 - **Packet format** (per gist `feeder.c`): magic `"PRB0"` + 64-bit big-endian
   sequence number + `0xA5` fill to size.
+- **Probe RX MUST set an explicit forward port (`-u <dead port>` / `-U <sock>`).**
+  `wfb_rx` defaults its decoded-payload forward to `127.0.0.1:5600` — the **RTP
+  video port**. A probe `wfb_rx` left at the default injects accepted `PRB` packets
+  straight into the live H.265 decoder and flaps the video. The probe needs only
+  the `-Y` rx_ant stats; the decoded payload is unused, so send it to a dead local
+  port. (Root-caused 2026-06-10: this — not adapter sharing or host CPU — was the
+  Test-C "video on/off flap." `-x` flapped because plaintext probe packets were
+  *accepted* and forwarded to 5600; AEAD-on dropped them, so no flap.)
 
 ## 5. Measurement
 
@@ -193,13 +201,82 @@ PR/spec** that must move three pieces in lockstep:
   PHY) + the paced feeder, gated like `wfbmode`; the MCS sweep driven by
   `wfb_tx_cmd set_radio`.
 - **`gs_supervisor` (ground):** spawn the probe `wfb_rx_native -Y` per rung (or one
-  for the swept TX) on the RX-only adapter and run `probe_log`, teeing probe
-  records into the existing stats path (same place the `-Y` video tee goes).
+  for the swept TX) and run `probe_log`, teeing probe records into the existing
+  stats path (same place the `-Y` video tee goes). **The probe RX MUST be given an
+  explicit forward port (`-u <dead port>` / `-U <sock>`) — never the `5600` default,
+  which is the live RTP video sink (see §4).** Cleaner still: skip the second
+  `wfb_rx` entirely and demux the probe `radio_port` inside the *existing* video
+  `wfb_rx` (both diversity adapters already capture the probe frames in monitor
+  mode), which never forwards probe payloads to the decoder at all. NB: the
+  RX-only-adapter advice elsewhere was a red herring — adapter sharing was never the
+  flap cause; the forward-port collision was.
 - **`link_controller` (air unit):** consume probe PER over the existing
   back-channel for the **promote** decision (raise MCS only when `cur+1` probe PER
   is clean); **demotion stays reactive** on live video PER. Replaces the
   RSSI-threshold "headroom" inference (§6).
 Fold probe-PER features into `wfb_link_score.py` and the Tier-1 retrain.
+
+## 8b. Mixed/parallel probing — VALIDATED on device (2026-06-10)
+
+Key realization (from reading live `wfb_rx -Y`): the stats key is `freq:mcs:bw`, so a
+**single `wfb_rx` already demultiplexes by MCS inside every `-l` window**. Sequential
+dwelling (swept single TX) is therefore the wrong model — it caps freshness at the
+sweep period and the shell feeder caps total rate at ~20 pps, so a compressed sweep
+trades PER resolution for freshness and loses both.
+
+**Parallel/mixed probing wins on both axes** and is the recommended production form:
+run **one continuous fixed-MCS `wfb_tx` per headroom rung** (distinct `radio_port =
+link_id + index`), each at a full 20 pps. Every rung then refreshes every 100 ms
+(`-l 100`) simultaneously — no sweep latency. Distinct radio_ports are required (same
+port + multiple TX corrupts the rx_ant seq/lost counting).
+
+Device soak (Star6E imx335 @192.168.1.13, GS = x86 + 2× RTL88x2, fixed distance):
+- **Tooling:** `probe_drone.sh <cur> <link> <pps> <secs> "5 6 7"` (3 concurrent TX) +
+  `probe_ground_parallel_soak.sh "5 6 7" 50` (3 RX, forward-port-safe `-u`, → `probe_log`
+  → `probe_bridge.py` → uplink `udp_in 6600` → `link_controller :5801`).
+- **Freshness:** `v2_age` dropped from **6–26 s (swept) → 0.04–0.6 s (parallel)**.
+- **Tuning that worked:** `mcs.probe_stale_age_s=1.0`, `probe_log --window-s 0.5`
+  (≈20 packets/rung accounted → ~5 % PER granularity), 20 pps/rung, rungs 5/6/7.
+  `--window-s 0.3` was too short (≈6 packets → frequent `accounted=0` → invalid PER).
+- **Control-law result:** with aggressive 1 s staleness + 10 Hz data, mode=1
+  **converged to `mcs_max` and held — `commit_count` froze, `changes_in_window=0`,
+  no oscillation, no failsafe; video downlink clean throughout.** The steady-state
+  de-risk passes.
+- **Residual:** at the ceiling, V+2 = MCS 7 occasionally reads invalid (`per_milli=-1`,
+  `accounted=0`) — real MCS-7 cliff marginality, not a tooling artifact. The law treats
+  invalid as **hold** (not fail), so it is safe.
+- **3 concurrent probe TX showed no driver stress** on the vehicle 8812eu (video link
+  `rx_ant_age` stayed ~0.02–0.1 s). The earlier "wide blast" stress was 4+ rungs.
+
+Note `probe_stale_age_s` default is 1.5 (tuned for slower data); fast parallel probing
+wants ~1.0. Phase 4 should set the production default to match the probe cadence.
+
+## 8c. Phase 4 — PRODUCTIONIZED (2026-06-10)
+
+The prototype rig (`probe/*.sh` + `probe_log.py` + `probe_bridge.py`) is folded
+into the production daemons. Full spec + implementation notes:
+`specs/2026-06-10-boundary-probe-phase4/requirements.md`.
+
+Production shape (single V+2 stream — the law reads only `rung[current+2]`, and
+one TX retuned over time keeps `freq:mcs:bw` bucketing valid, so the N-parallel
+prototype collapses to **1 probe TX + 1 probe RX, no sweep**):
+
+- **Vehicle:** `S99wfb` (gated by `fw_setenv wfbprobe 1`) spawns one probe
+  `wfb_tx` (link 50/port 50, mirrors video PHY, FEC 1/1, `-x`, `-C 8001`,
+  `-u 5750`). `link_controller --probe 127.0.0.1:8001 --probe-feed
+  127.0.0.1:5750` feeds it paced PRB packets (20 pps, main-loop tick) and
+  retunes it to `min(current+2, 7)` on every commit (reconciler + commit-gate;
+  `mcs.probe_enabled` / `mcs.probe_feed_pps` / `mcs.probe_feed_bytes` tunables;
+  `probe_stale_age_s` default now **1.0**).
+- **Ground:** `host_x86.json` adds a `"probe": true` rx tunnel (udp_out 5751 —
+  dead port, enforced at config load). `gs_supervisor` computes the windowed
+  per-received-MCS PER in C (port of `probe_log.py --by-mcs`, 0.5 s window) and
+  forwards only `{"type":"probe"}` records to `stats_out` 6600 — raw probe
+  rx_ant is suppressed (it would pollute the vehicle's video scorer).
+- **Schema:** frozen in `tests/protocols/test_probe_protocol.py`.
+
+The prototype scripts stay for bench experiments (multi-rung sweeps, ladder
+characterization) but are no longer the deployment path.
 
 ## 9. Risks / open questions (validate before trusting)
 

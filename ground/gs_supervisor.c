@@ -279,7 +279,7 @@ const char *tunnel_state_name(TunnelState s)
 
 /* ---------- config loader -------------------------------------------- */
 
-int cfg_parse_tunnel(const char *js, JTok *toks, int n, int t_idx, Tunnel *t)
+static void tunnel_init_defaults(Tunnel *t)
 {
 	memset(t, 0, sizeof(*t));
 	t->mcs_index = -1; t->stbc = -1; t->ldpc = -1;
@@ -288,6 +288,11 @@ int cfg_parse_tunnel(const char *js, JTok *toks, int n, int t_idx, Tunnel *t)
 	t->stats_local_fd = -1;
 	t->st_rssi_best = INT_MIN;
 	t->autostart = true;
+}
+
+int cfg_parse_tunnel(const char *js, JTok *toks, int n, int t_idx, Tunnel *t)
+{
+	tunnel_init_defaults(t);
 
 	int v;
 	long lv;
@@ -357,6 +362,18 @@ int cfg_parse_tunnel(const char *js, JTok *toks, int n, int t_idx, Tunnel *t)
 			if (jstr(js, &toks[v], t->stats_out, sizeof(t->stats_out)) < 0)
 				return -1;
 		}
+
+		/* Boundary-probe PER producer (see PROBE_PER_SPEC.md). */
+		if ((v = jfind(js, toks, n, t_idx, "probe")) >= 0) {
+			if (jbool(js, &toks[v], &bv) < 0) return -1;
+			t->probe = bv;
+		}
+		t->probe_window_ms = 500;
+		if ((v = jfind(js, toks, n, t_idx, "probe_window_ms")) >= 0) {
+			if (jint(js, &toks[v], &lv) < 0) return -1;
+			if (lv < 100 || lv > 10000) return -1;
+			t->probe_window_ms = (int)lv;
+		}
 	} else {
 		if ((v = jfind(js, toks, n, t_idx, "udp_in_port")) < 0) return -1;
 		if (jint(js, &toks[v], &lv) < 0) return -1;
@@ -402,6 +419,241 @@ int cfg_parse_tunnel(const char *js, JTok *toks, int n, int t_idx, Tunnel *t)
 
 	t->state = TS_STOPPED;
 	t->pid   = -1;
+	return 0;
+}
+
+/* ---------- profile expansion ----------------------------------------
+ *
+ * "profile" synthesizes the canonical 3-tunnel topology — video rx
+ * (link 207), boundary-probe rx (link 50, PER producer), uplink tx
+ * (link 208, WCMD back-channel) — plus the adapter bring-up/down
+ * command blocks, from a handful of deployment facts:
+ *
+ *   "profile": {
+ *     "ifaces": ["wlxA", "wlxB"],      // monitor-mode adapters (1..4)
+ *     "uplink_iface": "wlxB",          // TX adapter (default: last)
+ *     "channel": 161,
+ *     "ht": "HT20",                    // optional (HT20/HT40+/HT40-)
+ *     "txpower_mbm": 2000,             // optional; absent = leave alone
+ *     "wfb_bin_dir": "/usr/local/bin"  // optional; absent = $PATH
+ *   }
+ *
+ * Link ids/ports must match the vehicle's S99wfb, so they are not
+ * configurable here by design; a hand-written "tunnels" array remains
+ * available as the advanced override (mutually exclusive with
+ * "profile"). Synthesis also makes the probe-forward foot-gun
+ * impossible: the probe tunnel always lands on a dead udp_out port,
+ * never 5600 (RTP video).
+ *
+ * Composition with an explicit "system" block: synthesized iface
+ * bring-up runs first, then the config's system.up entries (e.g. a
+ * walkout logger); on the way down the config's system.down entries
+ * run first, then the synthesized iface take-down. */
+
+#define PROFILE_VIDEO_LINK   207
+#define PROFILE_PROBE_LINK   50
+#define PROFILE_PROBE_PORT   50
+#define PROFILE_UPLINK_LINK  208
+#define PROFILE_STATS_FANIN  "127.0.0.1:6600"
+#define PROFILE_UPLINK_UDP_IN 6600
+#define PROFILE_UPLINK_CTRL  8000
+#define PROFILE_PROBE_SINK_IP   "127.0.0.1"  /* dead port: never 5600 */
+#define PROFILE_PROBE_SINK_PORT 5751
+
+static int profile_push_cmd(char cmds[][GS_PATH_MAX], int *count,
+                            const char *fmt, ...)
+{
+	if (*count >= GS_MAX_SYSTEM_CMDS) {
+		LOG_ERR("profile: synthesized system block exceeds %d "
+		        "commands — reduce ifaces or explicit system entries",
+		        GS_MAX_SYSTEM_CMDS);
+		return -1;
+	}
+	va_list ap;
+	va_start(ap, fmt);
+	int n = vsnprintf(cmds[*count], GS_PATH_MAX, fmt, ap);
+	va_end(ap);
+	if (n < 0 || n >= GS_PATH_MAX) return -1;
+	(*count)++;
+	return 0;
+}
+
+static void profile_set_binary(Tunnel *t, const char *bin_dir,
+                               const char *name)
+{
+	if (bin_dir[0])
+		snprintf(t->binary, sizeof(t->binary), "%s/%s", bin_dir, name);
+	/* else: empty binary → build_argv_* falls back to $PATH lookup */
+}
+
+static int cfg_expand_profile(const char *js, JTok *toks, int n,
+                              int p_idx, Config *c)
+{
+	int v;
+	long lv;
+
+	char ifaces[GS_MAX_IFACES][IFNAMSIZ];
+	int iface_count = 0;
+	v = jfind(js, toks, n, p_idx, "ifaces");
+	if (v < 0 || toks[v].type != JT_ARR ||
+	    toks[v].size < 1 || toks[v].size > GS_MAX_IFACES) {
+		LOG_ERR("profile: 'ifaces' must be an array of 1..%d names",
+		        GS_MAX_IFACES);
+		return -1;
+	}
+	int ci = v + 1;
+	for (int k = 0; k < toks[v].size; k++) {
+		if (jstr(js, &toks[ci], ifaces[k], IFNAMSIZ) < 0) return -1;
+		ci = jskip(toks, n, ci);
+		iface_count++;
+	}
+
+	char uplink[IFNAMSIZ];
+	snprintf(uplink, sizeof(uplink), "%s", ifaces[iface_count - 1]);
+	if ((v = jfind(js, toks, n, p_idx, "uplink_iface")) >= 0) {
+		if (jstr(js, &toks[v], uplink, sizeof(uplink)) < 0) return -1;
+		bool member = false;
+		for (int k = 0; k < iface_count; k++)
+			if (!strcmp(uplink, ifaces[k])) member = true;
+		if (!member) {
+			LOG_ERR("profile: uplink_iface '%s' not in ifaces[]",
+			        uplink);
+			return -1;
+		}
+	}
+
+	if ((v = jfind(js, toks, n, p_idx, "channel")) < 0 ||
+	    jint(js, &toks[v], &lv) < 0 || lv < 1 || lv > 200) {
+		LOG_ERR("profile: 'channel' (1..200) is required");
+		return -1;
+	}
+	int channel = (int)lv;
+
+	char ht[8] = "HT20";
+	if ((v = jfind(js, toks, n, p_idx, "ht")) >= 0) {
+		if (jstr(js, &toks[v], ht, sizeof(ht)) < 0) return -1;
+		if (strcmp(ht, "HT20") && strcmp(ht, "HT40+") &&
+		    strcmp(ht, "HT40-")) {
+			LOG_ERR("profile: ht must be HT20/HT40+/HT40-");
+			return -1;
+		}
+	}
+
+	long txpower_mbm = 0;
+	if ((v = jfind(js, toks, n, p_idx, "txpower_mbm")) >= 0) {
+		if (jint(js, &toks[v], &txpower_mbm) < 0 ||
+		    txpower_mbm < 0 || txpower_mbm > 4000) {
+			LOG_ERR("profile: txpower_mbm out of range [0, 4000]");
+			return -1;
+		}
+	}
+
+	char bin_dir[GS_PATH_MAX] = "";
+	if ((v = jfind(js, toks, n, p_idx, "wfb_bin_dir")) >= 0) {
+		if (jstr(js, &toks[v], bin_dir, sizeof(bin_dir)) < 0) return -1;
+	}
+
+	/* system.up: iface bring-up first, explicit entries after. The
+	 * sleeps match the reference config — monitor-mode flips race
+	 * driver state without them. */
+	char up[GS_MAX_SYSTEM_CMDS][GS_PATH_MAX];
+	int up_count = 0;
+	for (int k = 0; k < iface_count; k++) {
+		const char *ifc = ifaces[k];
+		if (profile_push_cmd(up, &up_count, "ip link set %s down", ifc) < 0 ||
+		    profile_push_cmd(up, &up_count, "iw dev %s set monitor otherbss", ifc) < 0 ||
+		    profile_push_cmd(up, &up_count, "sleep 0.5") < 0 ||
+		    profile_push_cmd(up, &up_count, "ip link set %s up", ifc) < 0 ||
+		    profile_push_cmd(up, &up_count, "sleep 0.5") < 0 ||
+		    profile_push_cmd(up, &up_count, "iw dev %s set channel %d %s", ifc, channel, ht) < 0)
+			return -1;
+		if (txpower_mbm > 0 &&
+		    (profile_push_cmd(up, &up_count, "sleep 0.5") < 0 ||
+		     profile_push_cmd(up, &up_count, "iw dev %s set txpower fixed %ld", ifc, txpower_mbm) < 0))
+			return -1;
+	}
+	for (int k = 0; k < c->system_up_count; k++)
+		if (profile_push_cmd(up, &up_count, "%s", c->system_up[k]) < 0)
+			return -1;
+	memcpy(c->system_up, up, sizeof(up));
+	c->system_up_count = up_count;
+
+	/* system.down: explicit entries first, iface take-down after. */
+	for (int k = 0; k < iface_count; k++)
+		if (profile_push_cmd(c->system_down, &c->system_down_count,
+		                     "ip link set %s down", ifaces[k]) < 0)
+			return -1;
+
+	/* The three canonical tunnels. */
+	Tunnel *t = &c->tunnels[0];
+	tunnel_init_defaults(t);
+	snprintf(t->name, sizeof(t->name), "video");
+	snprintf(t->role, sizeof(t->role), "rx");
+	profile_set_binary(t, bin_dir, "wfb_rx");
+	t->link_id = PROFILE_VIDEO_LINK;
+	t->radio_port = 0;
+	t->iface_count = iface_count;
+	for (int k = 0; k < iface_count; k++)
+		memcpy(t->ifaces[k], ifaces[k], IFNAMSIZ);
+	/* udp_out omitted → wfb_rx default 127.0.0.1:5600 (RTP video) */
+	snprintf(t->stats_out, sizeof(t->stats_out), PROFILE_STATS_FANIN);
+	t->probe_window_ms = 500;
+	t->extra_arg_count = 3;
+	snprintf(t->extra_args[0], GS_ARG_MAX, "-x");
+	snprintf(t->extra_args[1], GS_ARG_MAX, "-l");
+	snprintf(t->extra_args[2], GS_ARG_MAX, "100");
+
+	t = &c->tunnels[1];
+	tunnel_init_defaults(t);
+	snprintf(t->name, sizeof(t->name), "probe");
+	snprintf(t->role, sizeof(t->role), "rx");
+	profile_set_binary(t, bin_dir, "wfb_rx");
+	t->link_id = PROFILE_PROBE_LINK;
+	t->radio_port = PROFILE_PROBE_PORT;
+	t->iface_count = iface_count;
+	for (int k = 0; k < iface_count; k++)
+		memcpy(t->ifaces[k], ifaces[k], IFNAMSIZ);
+	snprintf(t->udp_out_ip, sizeof(t->udp_out_ip), PROFILE_PROBE_SINK_IP);
+	t->udp_out_port = PROFILE_PROBE_SINK_PORT;
+	snprintf(t->stats_out, sizeof(t->stats_out), PROFILE_STATS_FANIN);
+	t->probe = true;
+	t->probe_window_ms = 500;
+	t->extra_arg_count = 3;
+	snprintf(t->extra_args[0], GS_ARG_MAX, "-x");
+	snprintf(t->extra_args[1], GS_ARG_MAX, "-l");
+	snprintf(t->extra_args[2], GS_ARG_MAX, "100");
+
+	t = &c->tunnels[2];
+	tunnel_init_defaults(t);
+	snprintf(t->name, sizeof(t->name), "uplink");
+	snprintf(t->role, sizeof(t->role), "tx");
+	profile_set_binary(t, bin_dir, "wfb_tx");
+	t->link_id = PROFILE_UPLINK_LINK;
+	t->radio_port = 0;
+	t->iface_count = 1;
+	snprintf(t->ifaces[0], IFNAMSIZ, "%s", uplink);
+	t->udp_in_port = PROFILE_UPLINK_UDP_IN;
+	t->control_port = PROFILE_UPLINK_CTRL;
+	t->fec_k = 1;
+	t->fec_n = 2;
+	/* -T 1: close FEC blocks at 1 ms idle so the 3 redundant WCMD
+	 * copies span blocks (see CLAUDE.md "WCMD redundancy"). */
+	t->extra_arg_count = 2;
+	snprintf(t->extra_args[0], GS_ARG_MAX, "-T");
+	snprintf(t->extra_args[1], GS_ARG_MAX, "1");
+
+	c->tunnel_count = 3;
+
+	/* WCMD emit path defaults on unless the config said otherwise. */
+	if (!c->venc_cmd_uplink[0]) {
+		c->venc_cmd_enabled = true;
+		snprintf(c->venc_cmd_uplink, sizeof(c->venc_cmd_uplink),
+		         "uplink");
+	}
+
+	LOG_INFO("profile: synthesized video/probe/uplink tunnels "
+	         "(%d iface(s), uplink=%s, ch=%d %s)",
+	         iface_count, uplink, channel, ht);
 	return 0;
 }
 
@@ -492,28 +744,69 @@ int cfg_load(const char *path, Config *c)
 			c->venc_cmd_rate_limit_ms = (int)lv;
 	}
 
+	int prof_idx = jfind(buf, toks, n, 0, "profile");
 	int tarr = jfind(buf, toks, n, 0, "tunnels");
-	if (tarr < 0 || toks[tarr].type != JT_ARR) {
-		LOG_ERR("config: missing 'tunnels' array");
+	if (prof_idx >= 0 && tarr >= 0) {
+		LOG_ERR("config: 'profile' and 'tunnels' are mutually "
+		        "exclusive — drop one");
 		free(buf); return -1;
 	}
-	int kids = toks[tarr].size;
-	if (kids < 1 || kids > GS_MAX_TUNNELS) {
-		LOG_ERR("config: tunnel count %d out of range [1..%d]",
-		        kids, GS_MAX_TUNNELS);
-		free(buf); return -1;
-	}
-	int ci = tarr + 1;
-	for (int k = 0; k < kids; k++) {
-		if (cfg_parse_tunnel(buf, toks, n, ci, &c->tunnels[k]) < 0) {
-			LOG_ERR("config: tunnel #%d parse failed", k);
+	if (prof_idx >= 0) {
+		if (toks[prof_idx].type != JT_OBJ ||
+		    cfg_expand_profile(buf, toks, n, prof_idx, c) < 0) {
 			free(buf); return -1;
 		}
-		ci = jskip(toks, n, ci);
+	} else {
+		if (tarr < 0 || toks[tarr].type != JT_ARR) {
+			LOG_ERR("config: missing 'tunnels' array (or 'profile')");
+			free(buf); return -1;
+		}
+		int kids = toks[tarr].size;
+		if (kids < 1 || kids > GS_MAX_TUNNELS) {
+			LOG_ERR("config: tunnel count %d out of range [1..%d]",
+			        kids, GS_MAX_TUNNELS);
+			free(buf); return -1;
+		}
+		int ci = tarr + 1;
+		for (int k = 0; k < kids; k++) {
+			if (cfg_parse_tunnel(buf, toks, n, ci, &c->tunnels[k]) < 0) {
+				LOG_ERR("config: tunnel #%d parse failed", k);
+				free(buf); return -1;
+			}
+			ci = jskip(toks, n, ci);
+		}
+		c->tunnel_count = kids;
 	}
-	c->tunnel_count = kids;
-
 	free(buf);
+
+	/* Forward-port safety (the 2026-06-10 "video flap" class): wfb_rx
+	 * defaults its decoded-payload forward to 127.0.0.1:5600 — the RTP
+	 * video port. A probe tunnel forwarding there injects probe payloads
+	 * straight into the H.265 decoder. Reject that outright, and warn on
+	 * any two rx tunnels sharing an effective forward port (an omitted
+	 * udp_out counts as 5600). */
+	for (int k = 0; k < c->tunnel_count; k++) {
+		Tunnel *t = &c->tunnels[k];
+		if (strcmp(t->role, "rx") != 0) continue;
+		int eff = t->udp_out_ip[0] ? t->udp_out_port : 5600;
+		if (t->probe && (!t->udp_out_ip[0] || eff == 5600)) {
+			LOG_ERR("config: probe tunnel '%s' must set an explicit "
+			        "udp_out on a dead port (never 5600 = RTP video)",
+			        t->name);
+			return -1;
+		}
+		for (int j = 0; j < k; j++) {
+			Tunnel *o = &c->tunnels[j];
+			if (strcmp(o->role, "rx") != 0) continue;
+			int oeff = o->udp_out_ip[0] ? o->udp_out_port : 5600;
+			if (oeff == eff)
+				LOG_WARN("config: rx tunnels '%s' and '%s' both "
+				         "forward to udp:%d (omitted udp_out = "
+				         "5600) — decoded payloads will interleave",
+				         o->name, t->name, eff);
+		}
+	}
+
 	return 0;
 }
 
@@ -1207,6 +1500,82 @@ static int json_slice_object(const char *js, size_t jl, const char *key,
 	return -1;
 }
 
+/* ---------- boundary-probe PER producer ------------------------------ *
+ *
+ * For a tunnel with "probe": true, stats_drain() accumulates each rx_ant
+ * record's pkt counters into a bucket keyed by the *received* MCS (from
+ * the ant[] block) and flushes one compact {"type":"probe"} record per
+ * non-empty bucket per window to the tunnel's stats_out. Bucketing by
+ * received MCS means a window straddling a vehicle-side probe retune
+ * emits one clean record per MCS — pre-retune traffic can never land in
+ * the new rung. Port of telemetry/probe/probe_log.py --by-mcs (the
+ * device-validated prototype); schema frozen in
+ * tests/protocols/test_probe_protocol.py. */
+
+static void probe_buckets_reset(Tunnel *t, uint64_t now)
+{
+	memset(t->probe_bucket, 0, sizeof(t->probe_bucket));
+	for (int i = 0; i < 16; i++) t->probe_bucket[i].rssi = INT_MIN;
+	t->probe_win_start_us = now;
+}
+
+static void probe_window_flush(Tunnel *t, uint64_t now)
+{
+	double win_s = (double)(now - t->probe_win_start_us) / 1e6;
+	struct timespec rt;
+	clock_gettime(CLOCK_REALTIME, &rt);
+	unsigned long long ts_ms = (unsigned long long)rt.tv_sec * 1000ULL +
+	                           (unsigned long long)rt.tv_nsec / 1000000ULL;
+	for (int m = 0; m < 16; m++) {
+		uint32_t u = t->probe_bucket[m].uniq;
+		uint32_t l = t->probe_bucket[m].lost;
+		uint32_t acc = u + l;
+		if (acc == 0) continue;
+		char rssi_s[16] = "null";
+		if (t->probe_bucket[m].rssi != INT_MIN)
+			snprintf(rssi_s, sizeof(rssi_s), "%d",
+			         t->probe_bucket[m].rssi);
+		char rec[256];
+		int len = snprintf(rec, sizeof(rec),
+		    "{\"type\":\"probe\",\"ts_ms\":%llu,\"radio_port\":%d,"
+		    "\"mcs\":%d,\"per\":%.4f,\"recv\":%u,\"lost\":%u,"
+		    "\"accounted\":%u,\"rssi\":%s,\"window_s\":%.3f}\n",
+		    ts_ms, t->radio_port, m,
+		    (double)l / (double)acc, u, l, acc, rssi_s, win_s);
+		if (len > 0 && len < (int)sizeof(rec) && t->stats_fwd_active)
+			(void)sendto(t->stats_local_fd, rec, (size_t)len, 0,
+			             (struct sockaddr *)&t->stats_fwd_addr,
+			             sizeof(t->stats_fwd_addr));
+		t->probe_emit_count++;
+	}
+	probe_buckets_reset(t, now);
+}
+
+static void probe_accumulate(Tunnel *t, uint32_t uniq, uint32_t lost,
+                             int mcs, int rssi, uint64_t now)
+{
+	uint64_t win_us = (uint64_t)t->probe_window_ms * 1000ULL;
+	if (t->probe_win_start_us == 0)
+		probe_buckets_reset(t, now);
+	/* Stale partial window (probe traffic gap): the counts would span
+	 * far more than the nominal window — discard rather than emit a
+	 * record whose arrival time overstates its freshness. */
+	if (now - t->probe_win_start_us > 4 * win_us) {
+		probe_buckets_reset(t, now);
+		t->probe_drop_count++;
+	}
+	if (mcs >= 0 && mcs < 16) {
+		t->probe_bucket[mcs].uniq += uniq;
+		t->probe_bucket[mcs].lost += lost;
+		if (rssi != INT_MIN &&
+		    (t->probe_bucket[mcs].rssi == INT_MIN ||
+		     rssi > t->probe_bucket[mcs].rssi))
+			t->probe_bucket[mcs].rssi = rssi;
+	}
+	if (now - t->probe_win_start_us >= win_us)
+		probe_window_flush(t, now);
+}
+
 /* Drain pending rx_ant datagrams off a single tunnel's stats fd. */
 void stats_drain(Tunnel *t)
 {
@@ -1223,8 +1592,12 @@ void stats_drain(Tunnel *t)
 		buf[got] = 0;
 
 		/* Re-emit to user's stats_out before parsing — keeps latency
-		 * for the downstream consumer minimal. */
-		if (t->stats_fwd_active) {
+		 * for the downstream consumer minimal. Probe tunnels do NOT
+		 * re-emit raw rx_ant: forwarded up the uplink it would be
+		 * ingested by the vehicle's link_controller as *video* score
+		 * (probe loss → spurious reactive demotes). They forward the
+		 * computed {"type":"probe"} records instead (below). */
+		if (t->stats_fwd_active && !t->probe) {
 			(void)sendto(t->stats_local_fd, buf, (size_t)got, 0,
 			             (struct sockaddr *)&t->stats_fwd_addr,
 			             sizeof(t->stats_fwd_addr));
@@ -1242,18 +1615,23 @@ void stats_drain(Tunnel *t)
 		if (!is_rx_ant && !is_tx_stats) continue;
 
 		if (is_rx_ant) {
+			/* Record-local counters for the probe PER accumulator
+			 * (st_pkt_* keep "latest seen" semantics for the UI). */
+			uint32_t rec_uniq = 0, rec_lost = 0;
+			int      rec_mcs  = -1;
 			const char *pkt = NULL;
 			size_t pkl = 0;
 			if (json_slice_object(buf, (size_t)got, "pkt", &pkt, &pkl) == 0) {
 				uint32_t u;
 				if (json_pick_u32(pkt, pkl, "all",            &u) == 0) t->st_pkt_all      = u;
-				if (json_pick_u32(pkt, pkl, "lost",           &u) == 0) t->st_pkt_lost     = u;
+				if (json_pick_u32(pkt, pkl, "lost",           &u) == 0) { t->st_pkt_lost = u; rec_lost = u; }
 				if (json_pick_u32(pkt, pkl, "fec_recovered",  &u) == 0) t->st_pkt_fec      = u;
 				if (json_pick_u32(pkt, pkl, "outgoing",       &u) == 0) t->st_pkt_outgoing = u;
 				if (json_pick_u32(pkt, pkl, "dec_err",        &u) == 0) t->st_pkt_dec_err  = u;
 				if (json_pick_u32(pkt, pkl, "outgoing_bytes", &u) == 0) t->st_pkt_bytes    = u;
 				if (json_pick_u32(pkt, pkl, "uniq",           &u) == 0) {
 					t->st_pkt_uniq = u;
+					rec_uniq = u;
 					/* Scanner: any non-zero `uniq` sample during the
 					 * current step's dwell counts as "we found the
 					 * vehicle on this channel". `pkt.uniq` is the
@@ -1302,6 +1680,12 @@ void stats_drain(Tunnel *t)
 									if (avg > best_rssi) best_rssi = avg;
 								}
 							}
+							/* Received MCS of this ant entry (-Y keys
+							 * entries by freq:mcs:bw). Last one wins —
+							 * mirrors probe_log.py. */
+							int32_t am;
+							if (json_pick_i32(o, ol, "mcs", &am) == 0)
+								rec_mcs = am;
 							ant_count++;
 						}
 					}
@@ -1309,6 +1693,11 @@ void stats_drain(Tunnel *t)
 			}
 			t->st_ant_count = ant_count;
 			if (best_rssi != INT_MIN) t->st_rssi_best = best_rssi;
+
+			/* Boundary-probe PER accumulation + window flush. */
+			if (t->probe)
+				probe_accumulate(t, rec_uniq, rec_lost, rec_mcs,
+				                 best_rssi, now_us());
 		}
 
 		if (is_tx_stats) {
