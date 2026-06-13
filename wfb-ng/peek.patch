@@ -604,7 +604,7 @@ index 0000000..38c2c21
 +    return g_fail ? 1 : 0;
 +}
 diff --git a/src/tx.cpp b/src/tx.cpp
-index 2dc86ea..9da4d8c 100644
+index 2dc86ea..ea1e34d 100644
 --- a/src/tx.cpp
 +++ b/src/tx.cpp
 @@ -22,6 +22,7 @@
@@ -660,7 +660,7 @@ index 2dc86ea..9da4d8c 100644
      if (len <= 0 || len >= (int)sizeof(buf)) return;
      (void)sendto(g_stats_udp_fd, buf, (size_t)len, 0,
                   (const struct sockaddr*)&g_stats_udp_dst,
-@@ -157,10 +165,57 @@ static void stats_udp_emit_tx(uint64_t ts_ms, int interval_ms,
+@@ -157,10 +165,69 @@ static void stats_udp_emit_tx(uint64_t ts_ms, int interval_ms,
  }
  // --- end stats push ---
  
@@ -700,11 +700,23 @@ index 2dc86ea..9da4d8c 100644
 +
 +    if (o.signals & PEEK_SIG_FEC_CLOSE)
 +    {
-+        // Close the block on the access-unit boundary. Enqueue order matters:
-+        // the marked fragment is already in (above), so parity covers it.
-+        while (t->send_packet(NULL, 0, WFB_PACKET_FEC_ONLY));
-+        if (fec_timeout > 0) fec_close_ts = get_time_ms() + fec_timeout;
-+        count_peek_closes += 1;
++        // Threshold-gate the per-frame block close.  Closing a near-empty block
++        // zero-pads it to k ON-AIR and emits full n-k parity (see send_packet
++        // FEC_ONLY path), so a P-frame-heavy 60/120fps stream would put ~fec_n
++        // packets on air per frame regardless of payload — overflowing the TX
++        // ring.  Only honor the close once the block holds a worthwhile fraction
++        // of k; smaller frames carry into the next block (it still auto-closes
++        // at k, and tiny-frame loss isolation is cheap).
++        // NOTE: verify-stage fixed threshold (k/2); #2 turns this into a knob.
++        int k = t->block_k();
++        if (k <= 0 || (int)t->block_fill() * 2 >= k)
++        {
++            // Enqueue order matters: the marked fragment is already in (above),
++            // so parity covers it.
++            while (t->send_packet(NULL, 0, WFB_PACKET_FEC_ONLY));
++            if (fec_timeout > 0) fec_close_ts = get_time_ms() + fec_timeout;
++            count_peek_closes += 1;
++        }
 +    }
 +    return true;
 +}
@@ -718,7 +730,7 @@ index 2dc86ea..9da4d8c 100644
      encrypt_data(true),     /* AEAD on by default; -x disables per-fragment AEAD */
      epoch(epoch),
      channel_id(channel_id),
-@@ -311,6 +366,8 @@ RawSocketTransmitter::RawSocketTransmitter(int k, int n, const string &keypair,
+@@ -311,6 +378,8 @@ RawSocketTransmitter::RawSocketTransmitter(int k, int n, const string &keypair,
      current_output(0),
      ieee80211_seq(0),
      radiotap_header(radiotap_header),
@@ -727,7 +739,7 @@ index 2dc86ea..9da4d8c 100644
      frame_type(frame_type),
      use_qdisc(use_qdisc),
      fwmark_base(fwmark_base),
-@@ -318,6 +375,8 @@ RawSocketTransmitter::RawSocketTransmitter(int k, int n, const string &keypair,
+@@ -318,6 +387,8 @@ RawSocketTransmitter::RawSocketTransmitter(int k, int n, const string &keypair,
      inject_retries(inject_retries),
      inject_retry_delay(inject_retry_delay)
  {
@@ -736,7 +748,7 @@ index 2dc86ea..9da4d8c 100644
      for(auto it=wlans.begin(); it!=wlans.end(); it++)
      {
          int fd = socket(PF_PACKET, SOCK_RAW, 0);
-@@ -363,6 +422,27 @@ RawSocketTransmitter::RawSocketTransmitter(int k, int n, const string &keypair,
+@@ -363,6 +434,27 @@ RawSocketTransmitter::RawSocketTransmitter(int k, int n, const string &keypair,
      }
  }
  
@@ -764,7 +776,7 @@ index 2dc86ea..9da4d8c 100644
  void RawSocketTransmitter::inject_packet(const uint8_t *buf, size_t size)
  {
      assert(size <= MAX_FORWARDER_PACKET_SIZE);
-@@ -384,11 +464,17 @@ void RawSocketTransmitter::inject_packet(const uint8_t *buf, size_t size)
+@@ -384,11 +476,17 @@ void RawSocketTransmitter::inject_packet(const uint8_t *buf, size_t size)
      ieee_hdr[FRAME_SEQ_HB] = (ieee80211_seq >> 8) & 0xff;
      ieee80211_seq += 16;
  
@@ -784,7 +796,7 @@ index 2dc86ea..9da4d8c 100644
              },
              // ieee80211 header
              { .iov_base = (void*)ieee_hdr,
-@@ -781,6 +867,11 @@ bool Transmitter::send_packet(const uint8_t *buf, size_t size, uint8_t flags)
+@@ -781,6 +879,11 @@ bool Transmitter::send_packet(const uint8_t *buf, size_t size, uint8_t flags)
          return false;
      }
  
@@ -796,7 +808,7 @@ index 2dc86ea..9da4d8c 100644
      wpacket_hdr_t *packet_hdr = (wpacket_hdr_t*)block[fragment_idx];
  
      packet_hdr->flags = flags;
-@@ -800,6 +891,10 @@ bool Transmitter::send_packet(const uint8_t *buf, size_t size, uint8_t flags)
+@@ -800,6 +903,10 @@ bool Transmitter::send_packet(const uint8_t *buf, size_t size, uint8_t flags)
          set_mark(0);
      }
  
@@ -807,7 +819,7 @@ index 2dc86ea..9da4d8c 100644
      send_block_fragment(sizeof(wpacket_hdr_t) + size);
      max_packet_size = max(max_packet_size, sizeof(wpacket_hdr_t) + size);
      fragment_idx += 1;
-@@ -812,6 +907,10 @@ bool Transmitter::send_packet(const uint8_t *buf, size_t size, uint8_t flags)
+@@ -812,6 +919,10 @@ bool Transmitter::send_packet(const uint8_t *buf, size_t size, uint8_t flags)
      // mark fec packets with fwmark + 1
      set_mark(1);
  
@@ -818,7 +830,7 @@ index 2dc86ea..9da4d8c 100644
      while (fragment_idx < fec_n)
      {
          if(fec_delay > 0)
-@@ -902,6 +1001,8 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -902,6 +1013,8 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
      uint32_t count_b_injected = 0;  // successfully injected bytes (include additional fec packets)
      uint32_t count_p_dropped = 0;   // dropped due to rxq overflows or injection timeout
      uint32_t count_p_truncated = 0; // injected large packets that were truncated
@@ -827,7 +839,7 @@ index 2dc86ea..9da4d8c 100644
      int start_fd_idx = 0;
  
      // --- SHM ring attach (non-fatal: retry loop handles producer lifecycle) ---
-@@ -1033,7 +1134,11 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -1033,7 +1146,11 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                                    count_p_dropped, count_p_truncated,
                                    count_p_fec_timeouts,
                                    fec_k_now, fec_n_now,
@@ -840,7 +852,7 @@ index 2dc86ea..9da4d8c 100644
              }
  
              if(count_p_dropped)
-@@ -1046,6 +1151,12 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -1046,6 +1163,12 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                  WFB_ERR("%u packets truncated\n", count_p_truncated);
              }
  
@@ -853,7 +865,7 @@ index 2dc86ea..9da4d8c 100644
              count_p_fec_timeouts = 0;
              count_p_incoming = 0;
              count_b_incoming = 0;
-@@ -1053,6 +1164,8 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -1053,6 +1176,8 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
              count_b_injected = 0;
              count_p_dropped = 0;
              count_p_truncated = 0;
@@ -862,7 +874,7 @@ index 2dc86ea..9da4d8c 100644
  
              log_send_ts = cur_ts + log_interval - ((cur_ts - log_send_ts) % log_interval);
          }
-@@ -1227,6 +1340,56 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -1227,6 +1352,56 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                  }
                  break;
  
@@ -919,7 +931,7 @@ index 2dc86ea..9da4d8c 100644
                  default:
                  {
                      resp.rc = htonl(ENOTSUP);
-@@ -1346,7 +1509,8 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -1346,7 +1521,8 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                      session_key_announce_ts = cur_ts + SESSION_KEY_ANNOUNCE_MSEC;
                  }
  
@@ -929,7 +941,7 @@ index 2dc86ea..9da4d8c 100644
  
                  if (cur_ts >= log_send_ts)
                  {
-@@ -1482,7 +1646,8 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -1482,7 +1658,8 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                          session_key_announce_ts = cur_ts + SESSION_KEY_ANNOUNCE_MSEC;
                      }
  
@@ -939,7 +951,7 @@ index 2dc86ea..9da4d8c 100644
  
                      if (cur_ts >= log_send_ts)  // log timeout expired
                      {
-@@ -2161,8 +2326,37 @@ int main(int argc, char * const *argv)
+@@ -2161,8 +2338,37 @@ int main(int argc, char * const *argv)
      int encrypt_data = 1;           // -x (no-AEAD flag) flips to 0
      const char *stats_udp_target = NULL;  // -Y host:port; NULL = disabled
  
@@ -979,10 +991,10 @@ index 2dc86ea..9da4d8c 100644
              tx_mode = INJECTOR;
              srv_port = atoi(optarg);
 diff --git a/src/tx.hpp b/src/tx.hpp
-index e7a2cdc..a994aa7 100644
+index e7a2cdc..20d21f8 100644
 --- a/src/tx.hpp
 +++ b/src/tx.hpp
-@@ -90,9 +90,21 @@ public:
+@@ -90,9 +90,28 @@ public:
      virtual void dump_stats(uint64_t ts, uint32_t &injected_packets, uint32_t &dropped_packets, uint32_t &injected_bytes) = 0;
      virtual void update_radiotap_header(radiotap_header_t &radiotap_header) = 0;
      virtual radiotap_header_t get_radiotap_header(void) = 0;
@@ -990,6 +1002,13 @@ index e7a2cdc..a994aa7 100644
 +    // send_packet (0 = base MCS). Consumed and reset to 0 each send_packet, so
 +    // a caller that never sets it gets base-rate transmission unchanged.
 +    void set_tx_level(uint8_t level) { tx_level = level; }
++    // Current open-block fill (data fragments enqueued this block, 0..fec_k) and
++    // the live RS k.  peek_emit reads these to threshold-gate the per-frame
++    // FEC_CLOSE: closing a near-empty block zero-pads it to k on-air + full
++    // n-k parity (see send_packet FEC_ONLY path), which on a P-frame-heavy
++    // 60/120fps stream inflates the on-air packet rate severalfold.
++    uint8_t block_fill() const { return fragment_idx; }
++    int     block_k()    const { return fec_k; }
  protected:
      virtual void inject_packet(const uint8_t *buf, size_t size) = 0;
      virtual void set_mark(uint32_t idx) = 0;
@@ -1004,7 +1023,7 @@ index e7a2cdc..a994aa7 100644
  
  private:
      Transmitter(const Transmitter&);
-@@ -107,6 +119,7 @@ private:
+@@ -107,6 +126,7 @@ private:
      uint8_t fragment_idx;
      uint8_t** block;
      size_t max_packet_size;
@@ -1012,7 +1031,7 @@ index e7a2cdc..a994aa7 100644
      // Per-fragment AEAD (startup-only, no runtime command).  True = ChaCha20-
      // Poly1305 on each data fragment; false = plaintext with a
      // WFB_PACKET_DATA_PLAIN header (skips encrypt + 16 B tag on wire).
-@@ -182,6 +195,7 @@ public:
+@@ -182,6 +202,7 @@ public:
      virtual void update_radiotap_header(radiotap_header_t &radiotap_header)
      {
          this->radiotap_header = radiotap_header;
@@ -1020,7 +1039,7 @@ index e7a2cdc..a994aa7 100644
      }
  
      virtual radiotap_header_t get_radiotap_header(void)
-@@ -197,6 +211,23 @@ private:
+@@ -197,6 +218,23 @@ private:
          fwmark = fwmark_base + idx;
      }
  
@@ -1044,7 +1063,7 @@ index e7a2cdc..a994aa7 100644
      const uint32_t channel_id;
      int current_output;
      uint16_t ieee80211_seq;
-@@ -204,6 +235,11 @@ private:
+@@ -204,6 +242,11 @@ private:
      std::map<int, uint32_t> fd_fwmarks;
      tx_antenna_stat_t antenna_stat;
      radiotap_header_t radiotap_header;
