@@ -1504,6 +1504,31 @@ static int json_pick_i32(const char *js, size_t jl, const char *key, int32_t *ou
 	return -1;
 }
 
+/* Pull a string field value ("key":"value") into out_buf, NUL-terminated and
+ * truncated to out_sz.  Used to read the per-antenna "id" (hex antenna_id) so
+ * ant_count can dedup on physical chain rather than (chain × MCS-rung). */
+static int json_pick_str(const char *js, size_t jl, const char *key,
+                         char *out_buf, size_t out_sz)
+{
+	if (out_sz == 0) return -1;
+	size_t kl = strlen(key);
+	for (size_t i = 0; i + kl + 2 < jl; i++) {
+		if (js[i] != '"') continue;
+		if (memcmp(js + i + 1, key, kl) != 0) continue;
+		size_t p = i + 1 + kl;
+		if (p >= jl || js[p] != '"') continue;   /* close of the key quote */
+		p++;
+		while (p < jl && (js[p] == ' ' || js[p] == ':')) p++;
+		if (p >= jl || js[p] != '"') continue;    /* value must be a string */
+		p++;
+		size_t o = 0;
+		while (p < jl && js[p] != '"' && o + 1 < out_sz) out_buf[o++] = js[p++];
+		out_buf[o] = '\0';
+		return 0;
+	}
+	return -1;
+}
+
 /* Slice a JSON value by key — returns pointer + length of the substring
  * starting at the value (object, array, or scalar).  We only need this to
  * carve out the "pkt":{...} block so json_pick_u32 ranges stay scoped. */
@@ -1708,7 +1733,9 @@ void stats_drain(Tunnel *t)
 				/* Walk antenna list for best avg rssi.  rssi.avg is signed. */
 			const char *ant = NULL;
 			size_t al = 0;
-			int ant_count = 0;
+			int ant_count = 0;            /* raw ant[] objects (fallback) */
+			char seen_ids[16][24];        /* distinct antenna_id (physical chain) */
+			int  n_seen = 0;
 			int best_rssi = INT_MIN;
 			uint32_t mcs_hist[16] = {0}; /* per-received-MCS pkt counts, this window */
 			if (json_slice_object(buf, (size_t)got, "ant", &ant, &al) == 0 && al >= 2) {
@@ -1748,11 +1775,37 @@ void stats_drain(Tunnel *t)
 									mcs_hist[am] += (uint32_t)ap;
 							}
 							ant_count++;
+							/* ant_count should reflect PHYSICAL antenna
+							 * chains, not raw ant[] entries: wfb-ng keys
+							 * antenna_stat by (freq,mcs,bw,id), so one chain
+							 * appears once per MCS rung present this window
+							 * (downlink carries up to 3 at once: bulk +
+							 * peek-PROTECT + transitional).  Dedup on "id"
+							 * (= wlan_idx<<8|chain) so the count is hardware,
+							 * not the rung mix.  mcs_hist carries per-rung. */
+							char idbuf[24];
+							if (json_pick_str(o, ol, "id", idbuf,
+							                  sizeof idbuf) == 0) {
+								int dup = 0;
+								for (int s = 0; s < n_seen; s++)
+									if (strcmp(seen_ids[s], idbuf) == 0) {
+										dup = 1;
+										break;
+									}
+								if (!dup && n_seen < (int)(sizeof seen_ids /
+								                           sizeof seen_ids[0])) {
+									snprintf(seen_ids[n_seen],
+									         sizeof seen_ids[0], "%s", idbuf);
+									n_seen++;
+								}
+							}
 						}
 					}
 				}
 			}
-			t->st_ant_count = ant_count;
+			/* Prefer the deduped physical-chain count; fall back to the raw
+			 * object count if the -Y stream predates the per-ant "id" field. */
+			t->st_ant_count = (n_seen > 0) ? n_seen : ant_count;
 			if (best_rssi != INT_MIN) t->st_rssi_best = best_rssi;
 			/* Fold this rx_ant window's per-MCS counts into the current
 			 * 1 s ring slot. The API sums the last 10 slots, giving a

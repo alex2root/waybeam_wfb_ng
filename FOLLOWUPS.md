@@ -141,6 +141,18 @@ stay searchable.
 - ~~Per-iface txpower preset list (5/15/20/25 dBm) hardcoded twice.~~
   Lifted to `TXPOWER_PRESETS_MBM` JS constant; both rows
   (`renderQuickTxpowerRow` + `renderGsTxpowerRow`) consume it.
+- ~~**`ant_count` is rung-inflated, not physical antennas.**~~  The `ant[]`
+  walk counted every `{...}` object, but wfb-ng keys `antenna_stat` by
+  `(freq, mcs_index, bandwidth, antenna_id)` (`wfb-ng rx.cpp:599`), so each
+  physical chain appeared once per MCS rung present that window — `st_ant_count`
+  floated 2/4/6 on a 2-chain single card as the rung mix shifted (downlink
+  carries up to 3 at once: MCS5 bulk + MCS3 peek-PROTECT + MCS4 transitional).
+  Same root cause already fixed on the link_controller scorer; gs_supervisor was
+  never deduped.  Fixed: new `json_pick_str` helper + dedup the `ant[]` walk on
+  the per-entry `"id"` (= `wlan_idx<<8|chain`), with a fallback to the raw object
+  count if a pre-`id` `-Y` stream is seen.  `mcs_hist` still carries the per-rung
+  breakdown.  Device-verified on 192.168.2.20 (2026-06-13): ant_count 4→**2**
+  with 3 distinct rungs live.
 
 ## WebUI (gs.html)
 
