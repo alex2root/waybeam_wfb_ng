@@ -47,6 +47,9 @@ def main() -> None:
     ap.add_argument("--commit-secs", type=float, default=2.0, help="...or every this many seconds")
     ap.add_argument("--idle-timeout", type=float, default=0.0,
                     help="close the session after this many idle seconds (0 = run until Ctrl-C)")
+    ap.add_argument("--max-duration", type=float, default=1200.0,
+                    help="hard-cap a session at this many seconds, then roll a fresh "
+                         "one so files stay bounded (default 1200 = 20 min; 0 = unbounded)")
     ap.add_argument("--stats-every", type=float, default=5.0, help="seconds between log lines (0=silent)")
     for f in META_FIELDS:
         ap.add_argument(f"--{f.replace('_', '-')}", dest=f, default=None)
@@ -70,11 +73,14 @@ def main() -> None:
     rx.bind((args.bind, args.listen))
     if args.idle_timeout > 0:
         rx.settimeout(args.idle_timeout)
+    elif args.max_duration > 0:
+        rx.settimeout(2.0)              # wake periodically to honour the max-duration roll
 
     print(f"[ingest] listening udp {args.bind}:{args.listen} -> {args.db}",
           file=sys.stderr, flush=True)
 
     session_id: int | None = None
+    session_start = 0.0                 # monotonic time the current session opened
     n = n_bad = 0                       # totals
     pend = 0                            # uncommitted since last commit
     last_commit = last_log = time.monotonic()
@@ -89,29 +95,47 @@ def main() -> None:
 
     try:
         while True:
+            data = None
             try:
                 data, _ = rx.recvfrom(65535)
             except socket.timeout:
-                print(f"[ingest] idle {args.idle_timeout}s — closing session", file=sys.stderr)
-                break
-            try:
-                rec = json.loads(data)
-            except (ValueError, UnicodeDecodeError):
-                n_bad += 1
-                continue
-            if session_id is None:
-                meta = {f: getattr(args, f) for f in META_FIELDS}
-                session_id = store.create_session(conn, args.source, **meta)
-                print(f"[ingest] opened session {session_id}", file=sys.stderr, flush=True)
-            store.insert_record(conn, session_id, rec)
-            n += 1
-            pend += 1
-            win += 1
+                if args.idle_timeout > 0:
+                    print(f"[ingest] idle {args.idle_timeout}s — closing session", file=sys.stderr)
+                    break
+                # max-duration wake with no data: fall through to the deadline check
+
+            if data is not None:
+                try:
+                    rec = json.loads(data)
+                except (ValueError, UnicodeDecodeError):
+                    rec = None
+                    n_bad += 1
+                if rec is not None:
+                    if session_id is None:
+                        meta = {f: getattr(args, f) for f in META_FIELDS}
+                        session_id = store.create_session(conn, args.source, **meta)
+                        session_start = time.monotonic()
+                        print(f"[ingest] opened session {session_id}", file=sys.stderr, flush=True)
+                    store.insert_record(conn, session_id, rec)
+                    n += 1
+                    pend += 1
+                    win += 1
 
             now = time.monotonic()
+            # Hard session cap: close + roll a fresh session so files stay bounded
+            # (the next datagram opens the new one). The vehicle keeps logging
+            # continuously; LOG_SYNC re-attributes it across the boundary.
+            if (session_id is not None and args.max_duration > 0
+                    and (now - session_start) >= args.max_duration):
+                commit()
+                store.close_session(conn, session_id)
+                print(f"[ingest] session {session_id} hit max-duration "
+                      f"{args.max_duration:.0f}s — rolled", file=sys.stderr, flush=True)
+                session_id = None
+                win = 0
             if pend >= args.commit_every or (now - last_commit) >= args.commit_secs:
                 commit()
-            if args.stats_every > 0 and (now - last_log) >= args.stats_every:
+            if args.stats_every > 0 and win > 0 and (now - last_log) >= args.stats_every:
                 rate = win / (now - last_log)
                 print(f"[ingest] session {session_id}: {n} records "
                       f"({rate:.1f}/s, {n_bad} bad)", file=sys.stderr, flush=True)

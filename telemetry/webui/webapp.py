@@ -19,7 +19,12 @@ import json
 import os
 import subprocess
 import sys
+import urllib.request
 from datetime import datetime
+
+# gs_supervisor base URL — used to roll a matching vehicle SD log when a new GS
+# capture session starts (both run on the GS host). Override via env if needed.
+GS_SUPERVISOR_URL = os.environ.get("GS_SUPERVISOR_URL", "http://127.0.0.1:80")
 
 # wfb_store lives one dir up (telemetry/); make it importable when run directly.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -75,16 +80,33 @@ def capture_new():
     ingester (stamps ended_at) and start a new one (new `sessions` row).
     `capture_session.sh start` reclaims the UDP port and re-launches, so it IS
     the roll. The ingester runs as root (launched by gs_supervisor), so we go
-    through `sudo -n`. With LOG_SYNC active the vehicle keeps logging
-    continuously and the importer attributes its records to whichever GS
-    session was live — so this boundary carries to the vehicle data with no
-    vehicle restart."""
+    through `sudo -n`.
+
+    Optional `duration` (seconds, JSON body or query) caps the new session — the
+    ingester rolls itself again at that age. We also poke gs_supervisor to roll a
+    matching vehicle SD log (WCMD_KEY_LOG_CONTROL) so the two stay time-aligned;
+    with LOG_SYNC the importer attributes vehicle records to whichever GS session
+    was live, so the boundary carries either way."""
     if not os.path.exists(CAPTURE_SH):
         return jsonify(ok=False, error="capture_session.sh not found"), 500
+
+    # Optional session cap. Parse from JSON body or query/form; clamp to a sane
+    # window so a fat-fingered value can't disable the cap or spin sub-second.
+    duration = None
+    body = request.get_json(silent=True) or {}
+    raw = body.get("duration", request.values.get("duration"))
+    if raw is not None and raw != "":
+        try:
+            duration = int(float(raw))
+        except (TypeError, ValueError):
+            return jsonify(ok=False, error="duration must be a number (seconds)"), 400
+        duration = max(30, min(duration, 7200))
+
+    argv = ["sudo", "-n", "bash", CAPTURE_SH, "start"]
+    if duration is not None:
+        argv.append(str(duration))   # a validated int — argv (no shell), no injection
     try:
-        # Fixed argv, no user input — not shell-interpolated, so no injection.
-        r = subprocess.run(["sudo", "-n", "bash", CAPTURE_SH, "start"],
-                           capture_output=True, text=True, timeout=20)
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=20)
     except subprocess.TimeoutExpired:
         return jsonify(ok=False, error="capture_session.sh timed out"), 504
     except OSError as e:
@@ -92,7 +114,20 @@ def capture_new():
     msg = (r.stdout or "").strip()
     if r.stderr.strip():
         msg = (msg + "  " + r.stderr.strip()).strip()
-    return jsonify(ok=(r.returncode == 0), message=msg, code=r.returncode)
+
+    # Best-effort: roll a matching vehicle SD log so it aligns with this new GS
+    # session. Never fail the GS roll if the vehicle/uplink is unreachable.
+    vehicle = None
+    if r.returncode == 0:
+        try:
+            with urllib.request.urlopen(
+                    GS_SUPERVISOR_URL + "/api/v1/logctl?value=1", timeout=2) as resp:
+                vehicle = "rolled" if resp.status == 200 else f"http {resp.status}"
+        except Exception as e:   # noqa: BLE001 — best-effort; surface, don't fail
+            vehicle = f"skipped ({type(e).__name__})"
+
+    return jsonify(ok=(r.returncode == 0), message=msg, code=r.returncode,
+                   duration=duration, vehicle_log=vehicle)
 
 
 @app.route("/api/vehicle/fetch", methods=["POST"])
