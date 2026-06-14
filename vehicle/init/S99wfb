@@ -78,6 +78,18 @@ log() { echo "[wfb] $*" | tee -a "$LOG"; }
 start_wfb() {
     log "starting WFB-NG broadcaster"
 
+    # Guard against double-start. A bare repeated `start` (boot + a manual
+    # start, or a deploy that skipped `stop`) would otherwise STACK a second
+    # link_controller on top of the running one — two controllers then fight
+    # over the wfb_tx control socket (-C) and the venc HTTP API, which surfaces
+    # as link / MCS flapping. If anything from a prior run is still alive, clear
+    # it first so `start` is idempotent (behaves like `restart`).
+    if pidof link_controller wfb_tx wfb_rx >/dev/null 2>&1; then
+        log "start: existing wfb instance detected — clearing it first (no double-start)"
+        stop_wfb
+        sleep 0.5
+    fi
+
     # Tear down AP (kills hostapd + adapter monitor + flushes wlan0)
     /usr/bin/adapter stop >> "$LOG" 2>&1
     sleep 0.5
@@ -185,6 +197,11 @@ stop_wfb() {
     done
     sleep 0.5
     killall -q link_controller wfb_rx wfb_tx 2>/dev/null
+    # Legacy cleanup: pre-#70 images spawned a separate walkout_logger.sh (SD
+    # logging is in-process in link_controller now). Reap any survivor so it
+    # can't linger as an orphan across a stop/start.
+    killall -q walkout_logger.sh 2>/dev/null
+    rm -f /var/run/walkout_logger.pid 2>/dev/null
     sleep 0.3
     ip link set wlan0 down 2>/dev/null
     # Return wlan0 to AP mode (or whatever wlanmode is set to)
