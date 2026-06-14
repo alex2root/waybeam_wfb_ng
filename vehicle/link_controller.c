@@ -3907,6 +3907,7 @@ static int help_to_text(char *buf, size_t cap)
 		"  GET /params            JSON of all tunable Config fields\n"
 		"  GET /schema            JSON array of tunable metadata\n"
 		"  GET /set?k=v&k=v...    apply changes; returns JSON\n"
+		"  GET /cmd?key=N&value=V local WCMD apply (peek/idr/record/…); returns JSON\n"
 		"  GET /status            unified JSON snapshot\n"
 		"  GET /fec/status        FEC subset\n"
 		"  GET /mcs/status        MCS subset\n"
@@ -4164,6 +4165,25 @@ static bool request_wants_html(const char *req)
 /* Forward decl — defined alongside config_defaults further below. */
 static int cfg_validate_warnings(const Config *c);
 
+/* Parse one integer query param `name=<int>` out of a query string. Returns
+ * true and sets *out on success; false if absent or non-numeric. Matches only
+ * at a key boundary (start or after '&') so "key" can't match "fec_key". */
+static bool qparam_long(const char *qs, const char *name, long *out)
+{
+	if (!qs) return false;
+	size_t nl = strlen(name);
+	for (const char *p = qs; (p = strstr(p, name)) != NULL; p += nl) {
+		bool at_bound = (p == qs) || (p[-1] == '&');
+		if (at_bound && p[nl] == '=') {
+			char *end;
+			long v = strtol(p + nl + 1, &end, 10);
+			if (end != p + nl + 1) { *out = v; return true; }
+			return false;
+		}
+	}
+	return false;
+}
+
 static void api_handle_request(ApiClient *c, Config *cfg, ApiSnapshot *snap)
 {
 	c->buf[c->pos < API_BUF_BYTES ? c->pos : API_BUF_BYTES - 1] = '\0';
@@ -4265,6 +4285,47 @@ static void api_handle_request(ApiClient *c, Config *cfg, ApiSnapshot *snap)
 		if (an > 0)
 			LOGV_COMMON(cfg, "api: applied %d key(s) via /set", an);
 		(void)cfg_validate_warnings(cfg);
+	}
+	else if (strcmp(path, "/cmd") == 0) {
+		/* Local WCMD console — apply a WCMD key from the device's own WebUI
+		 * (e.g. peek on/off, force_idr, record), reusing the exact
+		 * wcmd_dispatch path (clamp + per-key apply + /cmd/status counters)
+		 * as a ground WCMD, with a synthetic loopback peer + unique seq.
+		 * Same cmd.* policy applies (cmd.enabled / allow_keys_mask /
+		 * rate-limit), so a locked-down vehicle stays locked down here too.
+		 * No new trust surface: anyone who can reach :8765 can already /set
+		 * every tunable. snap->wcmd is the live &wcmd_state (rebuilt each
+		 * poll); the const is only for the read-only JSON builders. */
+		long key = 0, value = 0;
+		if (!qparam_long(qs, "key", &key) || key < 1 || key > WCMD_NUM_KEYS) {
+			api_send(c->fd, 400, "text/plain", "bad or missing key\n", 19);
+		} else {
+			(void)qparam_long(qs, "value", &value);   /* default 0 (force_idr) */
+			static uint16_t local_cmd_seq = 0;
+			WcmdReq req;
+			memset(&req, 0, sizeof(req));
+			req.magic    = htonl(WCMD_MAGIC);
+			req.version  = WCMD_VERSION;
+			req.msg_type = WCMD_MSG_REQ;
+			req.seq      = htons(++local_cmd_seq);
+			req.key      = (uint8_t)key;
+			req.value    = (int32_t)htonl((uint32_t)(int32_t)value);
+			struct sockaddr_in loop;
+			memset(&loop, 0, sizeof(loop));
+			loop.sin_family      = AF_INET;
+			loop.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+			WcmdResp resp;
+			(void)wcmd_dispatch(cfg, &req, &loop,
+			                    (WcmdState *)snap->wcmd, now_us(), &resp);
+			n = snprintf(body, sizeof(body),
+				"{\"key\":%u,\"value\":%ld,\"status\":%u,"
+				"\"http_status\":%u,\"applied_value\":%d}",
+				(unsigned)resp.key, value, (unsigned)resp.status,
+				(unsigned)ntohs(resp.http_status),
+				(int)ntohl((uint32_t)resp.applied_value));
+			if (n > 0) api_send(c->fd, 200, "application/json", body, n);
+			else       api_send(c->fd, 500, "text/plain", "json overflow\n", 14);
+		}
 	}
 	else if (strcmp(path, "/status") == 0) {
 		n = status_to_json(snap, body, sizeof(body));

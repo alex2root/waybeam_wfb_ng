@@ -674,6 +674,7 @@ async function renderTune() {
 
   root.innerHTML = "";
   root.appendChild(buildToggleStrips(params));
+  root.appendChild(buildCommandStrip());
   // Expert toggle — default /schema lists only operator-policy keys;
   // ?all=1 adds the algorithm mechanics. /set accepts both either way.
   const exp = document.createElement("label");
@@ -738,6 +739,69 @@ function buildToggleStrips(params) {
     row.appendChild(strip);
   }
   return row;
+}
+
+// WCMD action strip — peek/drop master switches + venc one-shots (force_idr,
+// record), applied LOCALLY via the /cmd loopback using the SAME WCMD keys the
+// ground sends. These are wfb_tx/venc actions, not link_controller Config
+// fields, so they go through /cmd (not /set). Fire-and-flash, like the
+// gs_supervisor "Vehicle peek" + "Encoder quick fires" strips — peek state
+// isn't in /status, so no stateful ON/OFF reflection.
+const WCMD_KEY = { FORCE_IDR: 4, RECORD: 15, PEEK_ENABLED: 16, PEEK_DROP_ENABLED: 17 };
+const WCMD_STATUS = { 0:"OK", 1:"DISABLED", 2:"UNKNOWN_KEY", 3:"KEY_BLOCKED",
+  4:"OUT_OF_RANGE", 5:"RATE_LIMITED", 6:"HTTP_ERROR", 7:"BAD_FORMAT", 8:"NOT_PERMITTED" };
+
+function buildCommandStrip() {
+  const row = document.createElement("div"); row.className = "strip-row";
+  const strip = document.createElement("div"); strip.className = "toggle-strip cmd-strip";
+  const label = document.createElement("span"); label.className = "label";
+  label.textContent = "Commands";
+  strip.appendChild(label);
+  const group = (name, btns) => {
+    const grp = document.createElement("span"); grp.className = "group";
+    const nm = document.createElement("span"); nm.className = "name"; nm.textContent = name;
+    grp.appendChild(nm);
+    for (const b of btns) {
+      const btn = document.createElement("button"); btn.textContent = b.text;
+      btn.addEventListener("click", () => localCmd(b.key, b.val, btn));
+      grp.appendChild(btn);
+    }
+    strip.appendChild(grp);
+  };
+  group("peek",   [{text:"ON",  key:WCMD_KEY.PEEK_ENABLED,      val:1},
+                   {text:"OFF", key:WCMD_KEY.PEEK_ENABLED,      val:0}]);
+  group("drop",   [{text:"ON",  key:WCMD_KEY.PEEK_DROP_ENABLED, val:1},
+                   {text:"OFF", key:WCMD_KEY.PEEK_DROP_ENABLED, val:0}]);
+  group("idr",    [{text:"force", key:WCMD_KEY.FORCE_IDR, val:0}]);
+  group("record", [{text:"start", key:WCMD_KEY.RECORD, val:1},
+                   {text:"stop",  key:WCMD_KEY.RECORD, val:0}]);
+  const hint = document.createElement("span"); hint.className = "hint";
+  hint.textContent = "Local WCMD apply (loopback) — same keys the ground sends. "
+    + "peek = NAL-aware link protection on wfb_tx (protect key/ref frames + "
+    + "frame-boundary FEC close); drop sheds throwaway frames live; idr forces a "
+    + "keyframe; record toggles the venc DVR. Honours cmd.* policy + the 100 ms "
+    + "per-key rate limit.";
+  strip.appendChild(hint);
+  row.appendChild(strip);
+  return row;
+}
+
+// Fire a local WCMD via /cmd and flash the button by outcome. Sets the button
+// title to the WCMD status so RATE_LIMITED / DISABLED / KEY_BLOCKED aren't
+// silent (e.g. a too-fast ON→OFF on the same key is rate-limited).
+async function localCmd(key, val, btn) {
+  btn.classList.remove("on", "flash-bad");
+  try {
+    const r = await fetch("/cmd?key=" + key + "&value=" + val, {cache:"no-store"});
+    const j = await r.json();
+    const name = WCMD_STATUS[j.status] || ("status " + j.status);
+    btn.title = name + (j.http_status ? " (http " + j.http_status + ")" : "");
+    if (j.status === 0) { btn.classList.add("on"); setTimeout(() => btn.classList.remove("on"), 700); }
+    else { btn.classList.add("flash-bad"); setTimeout(() => btn.classList.remove("flash-bad"), 1300); }
+  } catch (e) {
+    btn.title = "request failed";
+    btn.classList.add("flash-bad"); setTimeout(() => btn.classList.remove("flash-bad"), 1300);
+  }
 }
 
 function syncAdaptiveButtons(onBtn, offBtn, isOn) {
