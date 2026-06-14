@@ -100,27 +100,15 @@ start_wfb() {
     iw dev wlan0 set channel $WFB_CHANNEL $WFB_HTMODE >> "$LOG" 2>&1
     iw dev wlan0 set txpower fixed $WFB_TXPOWER >> "$LOG" 2>&1
 
-    # NAL-aware peek protection. The --peek-profile loads the PROTECT/DROP
-    # action-rule table at launch; the WCMD/WebUI toggle only arms/disarms
-    # the pipeline and cannot load rules. "idr" (default) protects param-sets
-    # (base MCS-2) + IDR/CRA key frames (base MCS-1) relative to the live
-    # adaptive MCS — the safe choice. "off" = frame-boundary FEC close only.
-    # refpred/idr+refpred add trail_n DROP and are UNSAFE unless the encoder
-    # emits true disposable frames (Star6E HEVC refPred no-ops — see memory).
-    # Override: fw_setenv wfbpeek off|idr|refpred|idr+refpred.
-    WFB_PEEK_PROFILE=$(fw_get wfbpeek idr)
-
-    # Short-tail peek close (proportional parity, no on-air zero-padding).
-    # When on, every frame's FEC block closes via close_block_short(): one
-    # boundary marker fragment + p~proportional parity instead of padding to k
-    # on-air + full n-k parity.  Restores full per-frame loss isolation at a
-    # fraction of the airtime the gate gave up.  REQUIRES a SHORT_TAIL-aware RX
-    # (gs_supervisor wfb_rx built from peek.patch >= 2026-06-14); an old RX would
-    # stall short blocks.  Default off => threshold-gated full-padding close.
-    # Override: fw_setenv wfbshorttail 1.
-    WFB_SHORT_TAIL=$(fw_get wfbshorttail 0)
-    WFB_SHORT_TAIL_ARG=""
-    case "$WFB_SHORT_TAIL" in 1|on|yes) WFB_SHORT_TAIL_ARG="--peek-short-tail" ;; esac
+    # Peek = per-frame FEC close. --peek-profile selects the startup state; the
+    # WCMD/WebUI peek toggle arms/disarms it live.
+    #   close (default) — armed: close each video frame's FEC block at the RTP
+    #     marker for per-frame loss isolation + tighter RTP timing.
+    #   off — peek disabled (no per-frame close).
+    # The old NAL-aware PROTECT/DROP profiles (idr/refpred) and the short-tail
+    # close were removed — both flapped the MCS loop; only the gate close ships.
+    # Override: fw_setenv wfbpeek off|close.
+    WFB_PEEK_PROFILE=$(fw_get wfbpeek close)
 
     # wfb_tx (SHM input from venc).  -T sizes the FEC safety-net timeout
     # to the typical frame period (60 fps ≈ 16 ms); fec_controller can
@@ -128,7 +116,7 @@ start_wfb() {
     wfb_tx -K "$KEY" -M $WFB_MCS -B $WFB_BW -k $WFB_K -n $WFB_N \
            -P 1 -Q -S 1 -L 1 -C $WFB_CTRL -T 16 \
            -H "$SHM_RING" -R 2097152 -s 2097152 \
-           --peek-profile "$WFB_PEEK_PROFILE" $WFB_SHORT_TAIL_ARG \
+           --peek-profile "$WFB_PEEK_PROFILE" \
            -l 1000 -i $WFB_TX_LINK -p 0 -x wlan0 \
            >> "$LOG" 2>&1 &
     echo $! > "$PID_TX"
