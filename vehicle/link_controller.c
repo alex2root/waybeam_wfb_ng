@@ -5340,7 +5340,11 @@ static void config_defaults(Config *c)
 	c->fec.bitrate_tolerance = 0.15f;
 	c->fec.bitrate_grace_s = 2.0f;
 	c->fec.mcs_settle_s    = 5.0f;
-	c->fec.bitrate_lead_s  = 0.5f;   /* MCS-down: let venc spool down ~500ms before dropping MCS */
+	c->fec.bitrate_lead_s  = 0.75f;  /* MCS-down: let venc spool down ~750ms before dropping MCS.
+	                                  * venc rate control needs ~0.75s to converge to the lower
+	                                  * bitrate; a shorter lead drops MCS while frames are still
+	                                  * sized for the old rate → on a marginal link the lower-MCS
+	                                  * airtime can't drain them → SHM ring overfill on the down step. */
 	c->fec.mcs_up_grace_s  = 0.25f;  /* MCS-up: settle the higher modulation before raising bitrate */
 	c->fec.subscribe_s = 2.0f;
 	c->fec.radio_poll_s = 1.0f;
