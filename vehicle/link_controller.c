@@ -292,24 +292,6 @@ typedef struct {
 		/* wfb_tx -Y stats subscriber port (0 = polling mode). */
 		uint16_t wfb_stats_port;
 
-		/* Post-MCS-drop FEC-parity boost. */
-		float    boost_s;
-		float    boost_mult;
-
-		/* Loss-driven redundancy (Adaptive-n).  Reuses the rx_ant loss
-		 * EWMAs the MCS loop already computes (smoothed_lost_ratio /
-		 * smoothed_recov_ratio) and biases redundancy ON TOP of the static
-		 * REDUNDANCY_CURVE — the curve stays the floor, loss only ever
-		 * RAISES n.  Fast-attack / slow-decay, decay frozen during MCS
-		 * settle.  Off by default; see docs/design/adaptive-n-rs-peek.md. */
-		bool     loss_adapt;
-		float    loss_adapt_gain;        /* g_lost:  residual-loss → redundancy  */
-		float    loss_adapt_recov_gain;  /* g_recov: recovered-frac early warning */
-		float    loss_adapt_ceiling;     /* hard cap on effective redundancy      */
-		float    loss_decay_s;           /* slow-release time const for the bias  */
-		float    loss_stale_s;           /* no rx_ant within this → bias terms 0  */
-		int      airtime_max_pps;        /* cap n·fps; loss parity never exceeds  */
-
 		/* Master switch. When false, the FEC subsystem stays idle
 		 * regardless of incoming sidecar / stats traffic — useful
 		 * for running mcs alone. */
@@ -819,7 +801,6 @@ typedef struct {
 	int   packets_per_frame;
 	float avg_frame_size;
 	float headroom;
-	float r_loss_bias;   /* redundancy added by Adaptive-n (0 = curve only) */
 } FecParams;
 
 static FecParams fec_compute(float avg_size, float headroom, const Config *cfg,
@@ -865,8 +846,6 @@ typedef struct {
 	uint64_t  last_update_us;
 	uint64_t  start_us;
 	uint32_t  update_count;
-	uint64_t  boost_until_us;
-	bool      was_boosting;
 	uint64_t  bitrate_grace_until_us;
 	bool      was_in_grace;
 	uint64_t  k_down_pending_since_us;
@@ -880,11 +859,6 @@ typedef struct {
 	 * an already-in-flight wfb_stats datagram (queued at the old high
 	 * MCS) from racing the pre-drop and pumping the bitrate back up. */
 	uint64_t  bitrate_up_lock_until_us;
-
-	/* Adaptive-n loss-bias state: the held redundancy bonus (fast attack,
-	 * slow decay).  loss_last_us bounds the decay one-pole. */
-	float     loss_r_held;
-	uint64_t  loss_last_us;
 
 	/* Feed-forward (blocksize_feedforward) thrash backstop: timestamp of the
 	 * last feed-forward k-step commit.  A flapping committed bitrate can't
@@ -914,17 +888,9 @@ static bool controller_commit(Controller *c, const FecParams *cand,
 	return true;
 }
 
-static void controller_arm_boost(Controller *c, const Config *cfg, uint64_t now)
-{
-	if (cfg->fec.boost_s > 0.0f)
-		c->boost_until_us = now + (uint64_t)(cfg->fec.boost_s * 1e6f);
-}
-
 static bool controller_update(Controller *c, const Config *cfg,
                               uint32_t frame_size, HeadroomRing *ring,
-                              uint64_t now,
-                              float loss_ewma, float recov_ewma,
-                              bool loss_fresh, float fps,
+                              uint64_t now, float fps,
                               long committed_kbps,
                               FecParams *out)
 {
@@ -959,81 +925,11 @@ static bool controller_update(Controller *c, const Config *cfg,
 	}
 	FecParams cand = fec_compute(size_basis, headroom, cfg, cur_ppf);
 
-	bool boost_active = (c->boost_until_us != 0 && now < c->boost_until_us);
-	bool boost_expired_now = (c->boost_until_us != 0 && !boost_active);
-	if (boost_expired_now) c->boost_until_us = 0;
-	bool boost_entry = (boost_active && !c->was_boosting);
-	c->was_boosting = boost_active;
-
-	if (boost_active) {
-		int parity = cand.n - cand.k;
-		if (parity < 1) parity = 1;
-		int boosted = cand.k + (int)ceilf((float)parity * cfg->fec.boost_mult);
-		if (boosted > cfg->fec.max_n) boosted = cfg->fec.max_n;
-		if (boosted <= cand.k)        boosted = cand.k + 1;
-		cand.n = boosted;
-		cand.redundancy = 1.0f - (float)cand.k / (float)cand.n;
-	}
-
-	/* ── Adaptive-n: bias redundancy up from measured loss (opt-in). ──
-	 * The curve+boost result (cand.n) is the floor; we only ever RAISE n.
-	 * Bias is fast-attack (parity up the instant loss appears) / slow-decay
-	 * (bleed off over loss_decay_s), and decay is frozen mid-MCS-settle so
-	 * parity is never released into an unsettled modulation.  Reuses the
-	 * already-smoothed rx_ant EWMAs; loss_fresh gates against a dead
-	 * feedback path.  See docs/design/adaptive-n-rs-peek.md. */
-	if (cfg->fec.loss_adapt) {
-		float r_loss_now = 0.0f;
-		if (loss_fresh) {
-			r_loss_now = cfg->fec.loss_adapt_gain       * loss_ewma +
-			             cfg->fec.loss_adapt_recov_gain * recov_ewma;
-			if (r_loss_now < 0.0f) r_loss_now = 0.0f;
-		}
-
-		bool mcs_unsettled =
-		    (c->bitrate_grace_until_us != 0 && now < c->bitrate_grace_until_us) ||
-		    (c->bitrate_up_lock_until_us != 0 && now < c->bitrate_up_lock_until_us);
-
-		if (r_loss_now >= c->loss_r_held) {
-			c->loss_r_held = r_loss_now;                       /* fast attack */
-		} else if (!mcs_unsettled && cfg->fec.loss_decay_s > 0.0f &&
-		           c->loss_last_us != 0) {
-			float dt = (float)(now - c->loss_last_us) / 1e6f;
-			float a  = 1.0f - expf(-dt / cfg->fec.loss_decay_s);
-			c->loss_r_held += a * (r_loss_now - c->loss_r_held); /* slow decay */
-		}
-		/* else: frozen (mid-MCS-settle) or no decay configured → hold. */
-		c->loss_last_us = now;
-
-		/* Snap a negligible residual to zero so the one-pole decay returns
-		 * cleanly to the curve (a <0.1% redundancy bias is meaningless and
-		 * a float epsilon would otherwise round ceil(k/(1-r)) up by one). */
-		if (c->loss_r_held < 1e-3f) c->loss_r_held = 0.0f;
-
-		if (c->loss_r_held > 0.0f) {
-			int   n_base = cand.n;                       /* curve+boost floor */
-			float r_base = (cand.n > cand.k)
-			    ? 1.0f - (float)cand.k / (float)cand.n : 0.0f;
-			float r_eff = r_base + c->loss_r_held;
-			if (r_eff > cfg->fec.loss_adapt_ceiling)
-				r_eff = cfg->fec.loss_adapt_ceiling;
-			if (r_eff > 0.99f) r_eff = 0.99f;
-			if (r_eff > r_base) {
-				int n_loss = (int)ceilf((float)cand.k / (1.0f - r_eff));
-				if (n_loss > cand.n) cand.n = n_loss;
-			}
-			/* Airtime rail: never let loss parity push n·fps over the cap,
-			 * but never undercut the base sizing (n_base). */
-			if (cfg->fec.airtime_max_pps > 0 && fps > 0.0f) {
-				int n_cap = (int)((float)cfg->fec.airtime_max_pps / fps);
-				if (cand.n > n_cap && n_cap >= n_base) cand.n = n_cap;
-			}
-			if (cand.n > cfg->fec.max_n) cand.n = cfg->fec.max_n;
-			if (cand.n <= cand.k)        cand.n = cand.k + 1;
-			cand.redundancy = 1.0f - (float)cand.k / (float)cand.n;
-		}
-		cand.r_loss_bias = c->loss_r_held;
-	}
+	/* FEC is purely frame-size driven: k tracks the frame, n = curve(k).
+	 * There is no loss-reactive parity here — the MCS selector is the sole
+	 * loss-response loop (demote to a more robust rung), and the static
+	 * REDUNDANCY_CURVE + the peek per-frame close carry block-level
+	 * protection.  On a stable link cand is constant, so nothing is emitted. */
 
 	bool in_startup_grace = (now - c->start_us) <
 	                        (uint64_t)(cfg->fec.startup_grace_s * 1e6f);
@@ -1046,11 +942,6 @@ static bool controller_update(Controller *c, const Config *cfg,
 	if (!c->have_current) {
 		if (in_grace) return false;
 		c->have_current = true;
-		return controller_commit(c, &cand, now, out);
-	}
-
-	if (boost_entry || boost_expired_now) {
-		if (cand.k == c->current.k && cand.n == c->current.n) return false;
 		return controller_commit(c, &cand, now, out);
 	}
 
@@ -1106,16 +997,15 @@ static bool controller_update(Controller *c, const Config *cfg,
 	if (k_delta == 0) {
 		c->k_up_pending_since_us = 0;
 		c->k_up_pending_target = 0;
-		/* k unchanged, but Adaptive-n may have moved n.  Raise parity
-		 * immediately (frames are failing now); release it only after the
-		 * up-cooldown so a decaying bias can't thrash the link. */
-		if (cfg->fec.loss_adapt && cand.n != c->current.n) {
-			if (cand.n > c->current.n)
-				return controller_commit(c, &cand, now, out);
-			float since = (float)(now - c->last_update_us) / 1e6f;
-			if (since >= cfg->fec.cooldown_up_s)
-				return controller_commit(c, &cand, now, out);
-		}
+		/* n = curve(k) for a fixed config, so a steady frame size leaves
+		 * cand == current and we emit nothing — this is the stable-link
+		 * silence.  n can still change without k if the operator live-edits
+		 * fec.min_n / fec.max_n (the curve result is clamped to them); in
+		 * that case re-commit so wfb_tx tracks the new bound.  This is a
+		 * deliberate operator action, never measurement noise, so it can't
+		 * reintroduce steady-state churn. */
+		if (cand.n != c->current.n)
+			return controller_commit(c, &cand, now, out);
 		return false;
 	}
 
@@ -1273,8 +1163,8 @@ static long payload_safe_bitrate_kbps(int payload_bytes)
 }
 
 /* Apply a fresh radio observation: update RadioState, detect external
- * changes vs the previous snapshot, log them, arm fec settle window
- * (mcs_settle_s) on any change, arm parity boost on MCS-down. */
+ * changes vs the previous snapshot, log them, and arm the fec settle
+ * window (mcs_settle_s) on any change. */
 static void radio_apply_observation(RadioState *radio, Controller *ctrl,
                                     const Config *cfg,
                                     int new_mcs, int new_bw, int new_gi,
@@ -1312,7 +1202,7 @@ static void radio_apply_observation(RadioState *radio, Controller *ctrl,
 		if (any_changed) {
 			/* Skip the "external" log when the change was driven by our
 			 * own mcs subsystem — caller has already logged the transition
-			 * with full context. The settle/boost arm still fire below. */
+			 * with full context. The settle arm still fires below. */
 			if (!from_self) {
 				LOG_FEC("radio: external change mcs %d->%d bw %d->%d gi %d->%d vht %d->%d nss %d->%d (phy=%.1fMbps)",
 				    prev_mcs, radio->mcs,
@@ -1324,13 +1214,7 @@ static void radio_apply_observation(RadioState *radio, Controller *ctrl,
 			}
 			if (cfg->fec.enabled) {
 				controller_arm_settle(ctrl, now, cfg->fec.mcs_settle_s);
-				if (mcs_changed && radio->mcs < prev_mcs) {
-					controller_arm_boost(ctrl, cfg, now);
-					if (cfg->fec.boost_s > 0.0f)
-						LOG_FEC("parity boost armed for %.1fs (mult=%.2f) [MCS drop %d->%d]",
-						    cfg->fec.boost_s, cfg->fec.boost_mult,
-						    prev_mcs, radio->mcs);
-				}
+				(void)mcs_changed;
 			}
 		}
 	}
@@ -3630,15 +3514,6 @@ static const TunableDesc TUNABLES[] = {
 	{"fec.mcs_settle_s",            SUB_FEC, TF_FLOAT, OFF_FEC(mcs_settle_s),            0.0, 60.0, "post-MCS-change FEC suppress"},
 	{"fec.bitrate_lead_s",          SUB_FEC, TF_FLOAT, OFF_FEC(bitrate_lead_s),          0.0, 5.0,  "MCS-down: lead time between bitrate pre-drop and SET_RADIO"},
 	{"fec.mcs_up_grace_s",          SUB_FEC, TF_FLOAT, OFF_FEC(mcs_up_grace_s),          0.0, 5.0,  "MCS-up: hold bitrate increase this long after the higher mcs commits"},
-	{"fec.boost_s",                 SUB_FEC, TF_FLOAT, OFF_FEC(boost_s),                 0.0, 30.0, "parity boost duration"},
-	{"fec.boost_mult",              SUB_FEC, TF_FLOAT, OFF_FEC(boost_mult),              1.0, 5.0,  "(n-k) parity multiplier during boost"},
-	{"fec.loss_adapt",              SUB_FEC, TF_BOOL,  OFF_FEC(loss_adapt),              0, 0,      "loss-driven redundancy (Adaptive-n)"},
-	{"fec.loss_adapt_gain",         SUB_FEC, TF_FLOAT, OFF_FEC(loss_adapt_gain),         0.0, 20.0, "residual-loss -> redundancy gain"},
-	{"fec.loss_adapt_recov_gain",   SUB_FEC, TF_FLOAT, OFF_FEC(loss_adapt_recov_gain),   0.0, 20.0, "FEC-recovered-frac early-warning gain"},
-	{"fec.loss_adapt_ceiling",      SUB_FEC, TF_FLOAT, OFF_FEC(loss_adapt_ceiling),      0.0, 0.95, "hard cap on effective redundancy"},
-	{"fec.loss_decay_s",            SUB_FEC, TF_FLOAT, OFF_FEC(loss_decay_s),            0.0, 60.0, "slow-release time const for loss bias"},
-	{"fec.loss_stale_s",            SUB_FEC, TF_FLOAT, OFF_FEC(loss_stale_s),            0.0, 60.0, "no rx_ant within this -> loss bias 0"},
-	{"fec.airtime_max_pps",         SUB_FEC, TF_INT,   OFF_FEC(airtime_max_pps),         0, 100000, "cap n*fps; loss parity never exceeds"},
 	/* Payload sizing — payload_max is intentionally NOT live (startup
 	 * only via --max-payload). payload_min is the only live-mutable
 	 * field; the bitrate→payload table itself is hard-coded
@@ -4084,8 +3959,7 @@ static int append_fec_json(char *buf, size_t cap, size_t pos,
 	int n = snprintf(buf + pos, cap - pos,
 		"\"fec\":{\"enabled\":%s,\"have_current\":%s,\"k\":%d,\"n\":%d,"
 		"\"avg_frame_size\":%.1f,\"update_count\":%u,\"fps\":%.2f,"
-		"\"in_grace\":%s,\"in_boost\":%s,\"loss_adapt\":%s,"
-		"\"redundancy\":%.3f,\"r_loss_bias\":%.3f,"
+		"\"in_grace\":%s,\"redundancy\":%.3f,"
 		"\"loss_ewma\":%.4f,\"recov_ewma\":%.4f},"
 		"\"wfb\":{\"last_set_fec_k\":%d,\"last_set_fec_n\":%d,"
 		"\"last_bitrate_kbps\":%ld,\"computed_safe_kbps\":%ld,"
@@ -4101,11 +3975,7 @@ static int append_fec_json(char *buf, size_t cap, size_t pos,
 		(double)fps_now,
 		(s->ctrl->bitrate_grace_until_us != 0 &&
 		    now_us() < s->ctrl->bitrate_grace_until_us) ? "true" : "false",
-		(s->ctrl->boost_until_us != 0 &&
-		    now_us() < s->ctrl->boost_until_us) ? "true" : "false",
-		s->cfg->fec.loss_adapt ? "true" : "false",
 		(double)s->ctrl->current.redundancy,
-		(double)s->ctrl->current.r_loss_bias,
 		(double)s->last_lost_ratio, (double)s->last_recov_ratio,
 		s->last_written_fec_k, s->last_written_fec_n,
 		s->last_written_kbps, computed_safe, age_s,
@@ -5345,18 +5215,6 @@ static void config_defaults(Config *c)
 	c->fec.subscribe_s = 2.0f;
 	c->fec.radio_poll_s = 1.0f;
 	c->fec.wfb_stats_port = 0;
-	c->fec.boost_s = 3.0f;
-	c->fec.boost_mult = 1.3f;
-	/* Adaptive-n: ON by default. Gains/ceiling are bench-tuning starting
-	 * points (see docs/design/adaptive-n-rs-peek.md). The curve stays the
-	 * floor, so with a clean link this is identical to the static path. */
-	c->fec.loss_adapt = true;
-	c->fec.loss_adapt_gain = 3.0f;
-	c->fec.loss_adapt_recov_gain = 0.5f;
-	c->fec.loss_adapt_ceiling = 0.60f;
-	c->fec.loss_decay_s = 2.0f;
-	c->fec.loss_stale_s = 2.0f;
-	c->fec.airtime_max_pps = 1100;
 	/* Adaptive payload sizing — feature off by default. Operator opts
 	 * in by setting --max-payload to their declared path-MTU ceiling. */
 	c->fec.payload_max          = 0;
@@ -6240,7 +6098,6 @@ int main(int argc, char **argv)
 			if (cfg.fec.enabled && fec_ctrl.have_current && radio.valid) {
 				int k = fec_ctrl.current.k, n = fec_ctrl.current.n;
 				float fps_hz = fps_get(&fps);
-				bool boost = (fec_ctrl.boost_until_us != 0 && now < fec_ctrl.boost_until_us);
 				/* Mirrors MCS heartbeat's WFB_MCS=N! tag — flag a drift
 				 * between the value the controller thinks it last wrote
 				 * and what actually got latched at wfb_tx. Most often a
@@ -6257,13 +6114,12 @@ int main(int argc, char **argv)
 					snprintf(payload_field, sizeof(payload_field),
 					         " P=%d", last_written_payload);
 				}
-				LOG_FEC("hb: k=%d n=%d avg=%.1fkB fps=%.1f mcs=%d phy=%.1fMbps br=%ldkbps%s upd=%u%s%s",
+				LOG_FEC("hb: k=%d n=%d avg=%.1fkB fps=%.1f mcs=%d phy=%.1fMbps br=%ldkbps%s upd=%u%s",
 				    k, n,
 				    fec_ctrl.avg_frame_size / 1024.0f, fps_hz,
 				    radio.mcs, radio.phy_mbps,
 				    last_written_kbps, payload_field,
 				    fec_ctrl.update_count,
-				    boost ? " BOOST" : "",
 				    divergence);
 			}
 			if (cfg.mcs.enabled) {
@@ -7015,7 +6871,7 @@ int main(int argc, char **argv)
 				else                                   radio_body = r;
 				last_emit_mcs = new_mcs;
 				/* Mirror into shared RadioState so the FEC subsystem
-				 * arms its settle/boost windows. from_self=true so the
+				 * arms its settle window. from_self=true so the
 				 * external-change log doesn't fire. */
 				radio_apply_observation(&radio, &fec_ctrl, &cfg,
 				    radio_body.mcs_index, radio_body.bandwidth, radio_body.short_gi,
@@ -7135,28 +6991,19 @@ int main(int argc, char **argv)
 			bp_skip_since_us = 0;
 			bp_recover_us    = 0;
 
-			/* Adaptive-n loss feedback: reuse the rx_ant EWMAs the MCS loop
-			 * already maintains.  Stale (no recent rx_ant) → terms forced to
-			 * zero so a dead feedback path can never strand phantom parity. */
 			uint64_t fec_now = now_us();
-			bool loss_fresh = cfg.fec.loss_adapt && last_rx_ant_us != 0 &&
-			    (fec_now - last_rx_ant_us) <
-			        (uint64_t)(cfg.fec.loss_stale_s * 1e6);
 
 			FecParams next_params;
 			bool emit = controller_update(&fec_ctrl, &cfg, frame_size, &fec_ring,
-			                              fec_now,
-			                              last_lost_ratio, last_recov_ratio,
-			                              loss_fresh, fps_get(&fps),
+			                              fec_now, fps_get(&fps),
 			                              last_written_kbps,
 			                              &next_params);
 			if (emit) {
-				LOG_FEC("FEC %s: k=%d n=%d (avg=%.0fB hd=%.2f ppf=%d red=%.2f rloss=%.2f fps=%.1f)",
+				LOG_FEC("FEC %s: k=%d n=%d (avg=%.0fB hd=%.2f ppf=%d red=%.2f fps=%.1f)",
 				    fec_ctrl.update_count == 1 ? "init" : "update",
 				    next_params.k, next_params.n,
 				    next_params.avg_frame_size, next_params.headroom,
 				    next_params.packets_per_frame, next_params.redundancy,
-				    next_params.r_loss_bias,
 				    fps_get(&fps));
 				if (!cfg.dry_run) {
 					if (wfb_send_set_fec(&cfg, next_params.k, next_params.n) != 0)
