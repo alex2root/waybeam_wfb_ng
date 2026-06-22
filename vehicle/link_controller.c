@@ -726,7 +726,10 @@ static int udp_listen_open(uint16_t port)
 /* Redundancy curve (k → r, linear interp). */
 typedef struct { int k; float r; } RedundancyPoint;
 static const RedundancyPoint REDUNDANCY_CURVE[] = {
-	{  1, 0.50f }, {  4, 0.40f }, {  8, 0.33f },
+	/* k=4 (the MCS0 floor, ~4-packet frames) trimmed 0.40->0.33 so the block
+	 * is 4/6 (≈5/7, 2 parity pkts) instead of 4/7 (3 parity) — less overhead
+	 * at the bottom rung, paired with the raised bitrate_min floor. */
+	{  1, 0.50f }, {  4, 0.33f }, {  8, 0.33f },
 	{ 16, 0.30f }, { 32, 0.27f }, { 48, 0.25f },
 };
 static const int REDUNDANCY_CURVE_LEN =
@@ -5230,7 +5233,11 @@ static void config_defaults(Config *c)
 	c->fec.k_up_dwell_s = 2.0f;
 	c->fec.startup_grace_s = 2.0f;
 	c->fec.safety_margin = 0.5f;
-	c->fec.bitrate_min_kbps = 1000;
+	/* Bitrate floor. Bites only where the safe budget (phy*k/n*margin) is
+	 * below it — i.e. only MCS0 (and MCS1 at very low fps); MCS2+ compute well
+	 * above this and keep margin 0.5. Set to 2800 so MCS0 runs an aggressive
+	 * ~60% airtime (≈2800 video + 4/6 FEC) instead of the 50%-margin 1857. */
+	c->fec.bitrate_min_kbps = 2800;
 	c->fec.bitrate_max_kbps = 0;
 	c->fec.bitrate_tolerance = 0.15f;
 	c->fec.bitrate_grace_s = 2.0f;

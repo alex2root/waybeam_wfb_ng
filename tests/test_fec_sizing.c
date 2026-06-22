@@ -85,7 +85,7 @@ int main(void)
 		FecParams b = fec_compute((float)(8 * mtu),  1.0f, &cfg, 0);
 		FecParams d = fec_compute((float)(12 * mtu), 1.0f, &cfg, 0);
 		FecParams e = fec_compute((float)(16 * mtu), 1.0f, &cfg, 0);
-		CHECK(a.k == 4  && a.n == 7,  "k=4  -> n=7  (curve r=0.40)");
+		CHECK(a.k == 4  && a.n == 6,  "k=4  -> n=6  (curve r=0.33, 4/6 MCS0)");
 		CHECK(b.k == 8  && b.n == 12, "k=8  -> n=12 (curve r=0.33)");
 		CHECK(d.k == 12 && d.n == 18, "k=12 -> n=18 (curve interp r=0.315)");
 		CHECK(e.k == 16 && e.n == 23, "k=16 -> n=23 (curve r=0.30)");
@@ -97,7 +97,7 @@ int main(void)
 		CHECK(cfg.fec.min_k == 4, "default min_k is 4");
 		CHECK(cfg.fec.min_n > cfg.fec.min_k, "default min_n > min_k (parity floor)");
 		FecParams p = fec_compute(1200.0f, 1.05f, &cfg, 0);   /* ppf=1 */
-		CHECK(p.k == 4 && p.n == 7, "tiny frame -> k=4 n=7 (floored, not 1/2)");
+		CHECK(p.k == 4 && p.n == 6, "tiny frame -> k=4 n=6 (floored, not 1/2)");
 	}
 
 	/* ── stable link: commit once, then silence (no n-flip) ── */
@@ -146,9 +146,9 @@ int main(void)
 		HeadroomRing ring = {0};
 		uint64_t t = BASE;
 		/* MCS0 operating point: ~1625 kbps @120fps -> ~1693 B/frame -> ppf=2,
-		 * floored to k=4 (n=7). */
+		 * floored to k=4 (n=6, 4/6). */
 		feed_ff(&c, &cfg, &ring, &t, 40, 1700u, 1625, 120.0f);
-		CHECK(c.current.k == 4 && c.current.n == 7, "MCS0: k floored to 4, n=7");
+		CHECK(c.current.k == 4 && c.current.n == 6, "MCS0: k floored to 4, n=6");
 		int k_low = c.current.k;
 
 		/* Jump to an MCS5-class operating point: ~17333 kbps @120fps ->
