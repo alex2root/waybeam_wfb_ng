@@ -864,6 +864,13 @@ typedef struct {
 	 * last feed-forward k-step commit.  A flapping committed bitrate can't
 	 * drive more than one feed-forward k-step per fec.ff_cooldown_s. */
 	uint64_t  ff_last_commit_us;
+
+	/* Committed venc bitrate at the last feed-forward commit (<=0 = none).
+	 * The prompt feed-forward path only fires when the operating point
+	 * actually moves; at a constant bitrate, k wiggle from headroom/fps
+	 * measurement noise falls through to the normal hysteresis path so a
+	 * stable link stays quiet. */
+	long      ff_last_kbps;
 } Controller;
 
 /* Arm the post-change settling window (extending only). */
@@ -945,27 +952,45 @@ static bool controller_update(Controller *c, const Config *cfg,
 		return controller_commit(c, &cand, now, out);
 	}
 
-	/* Feed-forward step: the committed-bitrate operating point is lag-free, so
-	 * commit a changed k *immediately* — do not freeze it through the settle
-	 * grace or gate it behind k_down_dwell.  Those guards exist to damp
-	 * measurement noise; a commanded operating-point change is not noise, and
-	 * freezing it is exactly the blocksize<->MCS desync (k pinned high while
-	 * frames have collapsed -> peek coalescing).  k unchanged falls through to
-	 * the normal measurement-trim / n-adaptation path below.
+	/* Feed-forward step: when the committed-bitrate OPERATING POINT moves (an
+	 * MCS transition), the new k is lag-free, so commit it *immediately* — do
+	 * not freeze it through the settle grace or gate it behind k_down_dwell.
+	 * Those guards exist to damp measurement noise; a commanded operating-point
+	 * change is not noise, and freezing it is exactly the blocksize<->MCS
+	 * desync (k pinned high while frames have collapsed -> peek coalescing).
+	 *
+	 * Gate on the bitrate having actually moved (> bitrate_tolerance since the
+	 * last ff commit).  At a CONSTANT bitrate the same ff_bytes path still
+	 * produces a k that wiggles ±1-2 from headroom / fps measurement noise;
+	 * that is NOT an operating-point change, so it falls through to the normal
+	 * hysteresis path below (which stays silent on a steady link).  This is the
+	 * fix for "needlessly small" k churn at a held MCS rung.
 	 *
 	 * Startup grace is still honored: it damps cold-start measurement
-	 * transients before the operating point is meaningfully established, and
-	 * bypassing it is a different rationale than skipping the *settle* freeze.
+	 * transients before the operating point is meaningfully established.
 	 *
 	 * Thrash backstop (ff_cooldown_s): the first k-step of any transition fires
 	 * immediately (no recent ff commit), but a flapping committed bitrate can't
 	 * drive more than one feed-forward k-step per cooldown — bounding k/n write
 	 * rate to wfb_tx on an oscillating link (set ff_cooldown_s=0 to disable). */
-	if (ff_active && !in_startup_grace && cand.k != c->current.k) {
+	/* Reference the deadband against the NEW bitrate (committed_kbps), exactly
+	 * as bitrate_assert does — otherwise an MCS-DOWN step leaves a narrow band
+	 * where bitrate_assert commits the lower operating point but this gate
+	 * doesn't fire, skipping the prompt k-down (the blocksize<->MCS desync the
+	 * ff path exists to prevent). Note: a sustained fps change at a constant
+	 * bitrate is intentionally NOT an operating-point move — it routes through
+	 * the normal hysteresis path below (rare, and that path converges). */
+	bool op_point_moved =
+	    (c->ff_last_kbps <= 0) ||
+	    (fabsf((float)(committed_kbps - c->ff_last_kbps)) >
+	     cfg->fec.bitrate_tolerance * (float)committed_kbps);
+	if (ff_active && !in_startup_grace && cand.k != c->current.k &&
+	    op_point_moved) {
 		uint64_t ff_cd = (uint64_t)(cfg->fec.ff_cooldown_s * 1e6f);
 		if (c->ff_last_commit_us == 0 || ff_cd == 0 ||
 		    (now - c->ff_last_commit_us) >= ff_cd) {
 			c->ff_last_commit_us = now;
+			c->ff_last_kbps = committed_kbps;
 			return controller_commit(c, &cand, now, out);
 		}
 		return false;   /* within cooldown: hold k this tick */

@@ -160,11 +160,62 @@ int main(void)
 		                                 &cfg, 0).n,
 		      "n still equals curve(k) after resize");
 
-		/* Hold the high operating point: must settle and stop emitting. */
+		/* Let it fully settle: after the step, the measured-ring headroom is
+		 * still draining old small frames, so k trims down through the normal
+		 * hysteresis path (k_down_dwell). Run well past that window. */
+		feed_ff(&c, &cfg, &ring, &t, 150, 18000u, 17333, 120.0f);
+		/* Now the steady tail must be silent. */
 		uint32_t upd_hi = c.update_count;
 		int churn_hi = feed_ff(&c, &cfg, &ring, &t, 200, 18000u, 17333, 120.0f);
-		CHECK(churn_hi == 0, "ZERO re-emits once the high rung is stable");
-		CHECK(c.update_count == upd_hi, "update_count frozen at high rung");
+		CHECK(churn_hi == 0, "ZERO re-emits once the high rung has settled");
+		CHECK(c.update_count == upd_hi, "update_count frozen at the settled high rung");
+	}
+
+	/* ── constant bitrate + fps noise must NOT churn k ──
+	 * Feed-forward sizes k from committed_kbps/fps, so fps jitter at a held
+	 * MCS rung makes cand.k wiggle ±1 across a packet boundary.  That is not
+	 * an operating-point change, so the prompt feed-forward path must stay
+	 * gated and the controller must stay silent (the bug: "FEC updates keep
+	 * coming in, needlessly small"). */
+	{
+		printf("[stable bitrate — fps jitter must not churn k]\n");
+		Config c2 = cfg;
+		Controller c = {0};
+		HeadroomRing ring = {0};
+		uint64_t t = BASE;
+		FecParams out;
+		/* Settle at a held rung. kbps=12555 sits right on a packet boundary:
+		 * fps=120 -> ppf 10, fps=108 -> ppf 11 (constant frame_size feeds a
+		 * flat headroom so fps is the only variable). */
+		const long KBPS = 12555;
+		for (int i = 0; i < 40; i++) {
+			controller_update(&c, &c2, 12000u, &ring, t, 114.0f, KBPS, &out);
+			t += DT_US;
+		}
+		int k0 = c.current.k;
+		uint32_t upd = c.update_count;
+		/* Now jitter fps across the boundary at a CONSTANT bitrate. */
+		int emits = 0;
+		for (int i = 0; i < 200; i++) {
+			float f = (i & 1) ? 108.0f : 120.0f;
+			if (controller_update(&c, &c2, 12000u, &ring, t, f, KBPS, &out))
+				emits++;
+			t += DT_US;
+		}
+		CHECK(emits == 0, "ZERO re-emits from fps jitter at a constant bitrate");
+		CHECK(c.update_count == upd, "update_count frozen across fps jitter");
+		CHECK(c.current.k == k0, "k held despite fps wiggle");
+
+		/* But a genuine bitrate step (operating-point move) still resizes
+		 * promptly via feed-forward. */
+		int step = 0;
+		for (int i = 0; i < 5; i++) {
+			if (controller_update(&c, &c2, 4000u, &ring, t, 114.0f, 4000, &out))
+				step++;
+			t += DT_US;
+		}
+		CHECK(step >= 1, "a real bitrate step still triggers a prompt resize");
+		CHECK(c.current.k < k0, "k dropped to track the lower operating point");
 	}
 
 	printf(g_fail ? "\nFAILED (%d failures)\n" : "\nPASSED (0 failures)\n", g_fail);
