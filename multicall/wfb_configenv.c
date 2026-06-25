@@ -150,6 +150,13 @@ int wfb_configenv_main(int argc, char **argv, int role)
 	ce_str(js, toks, ntok, "radio", "htmode", "HT20", s, sizeof(s)); emit_str("WFB_HTMODE", s);
 	emit_int("WFB_BW",      ce_int(js, toks, ntok, "radio", "bw", 20));
 	emit_int("WFB_TXPOWER", ce_int(js, toks, ntok, "radio", "txpower_mbm", 2000));
+	/* Monitor-iface MTU. Default 4052 = WLAN_DATA_MAXLEN, the rtl88x2eu
+	 * driver's hard max (rtl88x2eu/include/wifi.h). Larger RTP payloads from
+	 * adaptive payload sizing plus wfb_tx/radiotap framing must not exceed the
+	 * link MTU or injection wedges; the adaptive sizer caps at the 3200 tier
+	 * so 4052 is ample. S99wfb sets it after monitor mode; clamps to
+	 * [1500,4052] (this old kernel does not enforce max_mtu itself). */
+	emit_int("WFB_MTU",     ce_int(js, toks, ntok, "radio", "mtu", 4052));
 	ce_str(js, toks, ntok, "radio", "iface", "wlan0", s, sizeof(s)); emit_str("WFB_IFACE", s);
 	ce_str(js, toks, ntok, "key", "file", key_def, s, sizeof(s)); emit_str("KEY", s);
 	ce_str(js, toks, ntok, "key", "seed", "Waybeam", s, sizeof(s)); emit_str("WFB_KEY_SEED", s);
@@ -162,6 +169,11 @@ int wfb_configenv_main(int argc, char **argv, int role)
 	emit_int("WFB_PROBE_LINK", ce_int(js, toks, ntok, "links", "probe", 50));
 	emit_int("WFB_K", ce_int(js, toks, ntok, "fec", "k", 8));
 	emit_int("WFB_N", ce_int(js, toks, ntok, "fec", "n", 12));
+	/* Adaptive RTP payload sizing (link_controller). payload_max=0 -> off
+	 * (controller never writes outgoing.maxPayloadSize); >0 enables the
+	 * bitrate->payload tier sizer. Also live-tunable via /set. */
+	emit_int("WFB_PAYLOAD_MAX", ce_int(js, toks, ntok, "fec", "payload_max", 0));
+	emit_int("WFB_PAYLOAD_MIN", ce_int(js, toks, ntok, "fec", "payload_min", 576));
 	emit_int("WFB_MCS",     ce_int(js, toks, ntok, "mcs", "boot", 2));
 	emit_int("WFB_MCS_MIN", ce_int(js, toks, ntok, "mcs", "min", 1));
 	emit_int("WFB_MCS_MAX", ce_int(js, toks, ntok, "mcs", "max", 7));

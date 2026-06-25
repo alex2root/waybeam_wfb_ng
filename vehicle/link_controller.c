@@ -1338,6 +1338,10 @@ static int payload_select(const Config *cfg, long target_bitrate_kbps,
 
 	int max_p = cfg->fec.payload_max;
 	if (max_p > 4000) max_p = 4000;
+	/* payload_max is now live-mutable via /set (range floor 0=off), so a
+	 * value in (0,576) can reach here; clamp up to the venc API floor so
+	 * we never ask venc for a sub-576 payload. */
+	if (max_p < 576) max_p = 576;
 	int min_p = cfg->fec.payload_min;
 	if (min_p < 576)  min_p = 576;
 	if (min_p > 4000) min_p = 4000;
@@ -3745,11 +3749,15 @@ static const TunableDesc TUNABLES[] = {
 	{"fec.mcs_settle_s",            SUB_FEC, TF_FLOAT, OFF_FEC(mcs_settle_s),            0.0, 60.0, "post-MCS-change FEC suppress"},
 	{"fec.bitrate_lead_s",          SUB_FEC, TF_FLOAT, OFF_FEC(bitrate_lead_s),          0.0, 5.0,  "MCS-down: lead time between bitrate pre-drop and SET_RADIO"},
 	{"fec.mcs_up_grace_s",          SUB_FEC, TF_FLOAT, OFF_FEC(mcs_up_grace_s),          0.0, 5.0,  "MCS-up: hold bitrate increase this long after the higher mcs commits"},
-	/* Payload sizing — payload_max is intentionally NOT live (startup
-	 * only via --max-payload). payload_min is the only live-mutable
-	 * field; the bitrate→payload table itself is hard-coded
-	 * (operator-empirical). */
-	{"fec.payload_min",             SUB_FEC, TF_INT,   OFF_FEC(payload_min),             576, 4000, "live payload floor (bytes); venc API floor is 576"},
+	/* Payload sizing — both bounds are live-mutable and persistable via
+	 * wfb-link.json (fec.payload_max / fec.payload_min, mirrored by the
+	 * --max-payload / --payload-min CLI flags). payload_max = 0 disables
+	 * adaptive sizing: the controller stops writing outgoing.maxPayloadSize
+	 * and venc keeps whatever it currently has. Any payload_max in (0,576)
+	 * is clamped up to the venc API floor (576). The bitrate→payload tier
+	 * table itself is hard-coded (operator-empirical). */
+	{"fec.payload_max",             SUB_FEC, TF_INT,   OFF_FEC(payload_max),             0, 4000, "adaptive payload ceiling (bytes); 0=off, else clamped to [576,4000]", 1},
+	{"fec.payload_min",             SUB_FEC, TF_INT,   OFF_FEC(payload_min),             576, 4000, "adaptive payload floor (bytes); venc API floor is 576", 1},
 	{"fec.skip_on_backpressure",    SUB_FEC, TF_BOOL,  OFF_FEC(skip_on_backpressure),    0, 0,      "suppress FEC update for one tick when sidecar reports producer backpressure"},
 	{"fec.backpressure_fill_pct",   SUB_FEC, TF_INT,   OFF_FEC(backpressure_fill_pct),   0, 100,    "skip-FEC threshold (output queue fill %)"},
 	{"fec.desync_probe",            SUB_FEC, TF_BOOL,  OFF_FEC(desync_probe),            0, 0,      "diagnostic: per-frame trace of sidecar frame size vs committed k vs grace + peek coalescing factor"},
@@ -5295,6 +5303,10 @@ static void usage(const char *prog)
 		"  --sidecar HOST:PORT      venc sidecar (default 127.0.0.1:5602)\n"
 		"  --venc HOST:PORT         venc HTTP API (default 127.0.0.1:80)\n"
 		"  --safe-startup-bitrate N override safe-startup bitrate kbps (default 1500)\n"
+		"  --max-payload N          adaptive RTP payload ceiling bytes: 0=off (default),\n"
+		"                           else [576,4000]. Drives venc outgoing.maxPayloadSize\n"
+		"                           by bitrate tier. Also live via /set fec.payload_max.\n"
+		"  --payload-min N          adaptive RTP payload floor bytes [576,4000] (default 576)\n"
 		"\n"
 		"MCS subsystem — unified PER-probe law (disable with --no-mcs):\n"
 		"  Promotes when the V+2 probe rung reads clean; demotes on live\n"
@@ -5466,8 +5478,10 @@ static void config_defaults(Config *c)
 	c->fec.subscribe_s = 2.0f;
 	c->fec.radio_poll_s = 1.0f;
 	c->fec.wfb_stats_port = 0;
-	/* Adaptive payload sizing — feature off by default. Operator opts
-	 * in by setting --max-payload to their declared path-MTU ceiling. */
+	/* Adaptive payload sizing — feature off by default (payload_max = 0).
+	 * Operator opts in by setting fec.payload_max to their declared path-MTU
+	 * ceiling, either persisted in wfb-link.json (→ --max-payload) or live
+	 * via /set fec.payload_max. */
 	c->fec.payload_max          = 0;
 	c->fec.payload_min          = 576;
 
@@ -5499,7 +5513,9 @@ static void config_defaults(Config *c)
 	c->mcs.enabled = true;
 	strcpy(c->mcs.stats_host, "127.0.0.1"); c->mcs.stats_port = 5801;
 	c->mcs.rssi_ewma_alpha = 0.3f;
-	c->mcs.loss_ewma_alpha = 0.5f;
+	c->mcs.loss_ewma_alpha = 0.3f;   /* slower loss EWMA: a single bad sample
+	                                  * no longer trips the reactive demote;
+	                                  * the spike must persist a few samples */
 	c->mcs.rssi_aggregator = AGG_BEST_AVG;
 	c->mcs.down_cooldown_s  = 0.2f;
 	c->mcs.failsafe_timeout_s   = 0.5f;
@@ -5521,7 +5537,9 @@ static void config_defaults(Config *c)
 	 * approaching cliff reads 500-1000‰ within a window, so 200 keeps
 	 * the early-warning intact while reading "marginal" as hold. */
 	c->mcs.probe_fail_milli  = 200;   /* >=20% -> +2 fail  -> pre-empt demote*/
-	c->mcs.demote_per_milli  = 30;    /* >=3% live video PER -> reactive down*/
+	c->mcs.demote_per_milli  = 80;    /* >=8% live video PER -> reactive down
+	                                   * (was 3% — too eager; the V+2 probe is
+	                                   * the primary law, this is the backstop) */
 	c->mcs.promote_dwell_s   = 0.5f;
 	c->mcs.probe_window_s    = 0.5f;
 	c->mcs.probe_stale_age_s = 1.0f; /* matches ~10 Hz single-stream freshness
@@ -5646,6 +5664,7 @@ int main(int argc, char **argv)
 		OPT_WFB = 256, OPT_API_PORT, OPT_DRY_RUN,
 		/* fec */
 		OPT_NO_FEC, OPT_SIDECAR, OPT_VENC, OPT_SAFE_STARTUP_BITRATE,
+		OPT_MAX_PAYLOAD, OPT_PAYLOAD_MIN,
 		/* mcs */
 		OPT_NO_MCS, OPT_STATS, OPT_UPLINK_STATS, OPT_FAILSAFE, OPT_PROBE, OPT_PROBE_FEED,
 		/* csa */
@@ -5669,6 +5688,8 @@ int main(int argc, char **argv)
 		{"sidecar",        required_argument, 0, OPT_SIDECAR},
 		{"venc",           required_argument, 0, OPT_VENC},
 		{"safe-startup-bitrate", required_argument, 0, OPT_SAFE_STARTUP_BITRATE},
+		{"max-payload",    required_argument, 0, OPT_MAX_PAYLOAD},
+		{"payload-min",    required_argument, 0, OPT_PAYLOAD_MIN},
 		{"no-mcs",         no_argument,       0, OPT_NO_MCS},
 		{"stats",          required_argument, 0, OPT_STATS},
 		{"uplink-stats",   required_argument, 0, OPT_UPLINK_STATS},
@@ -5753,6 +5774,26 @@ int main(int argc, char **argv)
 				return 1;
 			}
 			cfg.fec.safe_startup_bitrate_kbps = v;
+			break;
+		}
+		case OPT_MAX_PAYLOAD: {
+			int v = atoi(optarg);
+			if (v != 0 && (v < 576 || v > 4000)) {
+				fprintf(stderr,
+				    "invalid --max-payload %d: must be 0 (off) or [576, 4000] bytes\n", v);
+				return 1;
+			}
+			cfg.fec.payload_max = v;
+			break;
+		}
+		case OPT_PAYLOAD_MIN: {
+			int v = atoi(optarg);
+			if (v < 576 || v > 4000) {
+				fprintf(stderr,
+				    "invalid --payload-min %d: must be in [576, 4000] bytes\n", v);
+				return 1;
+			}
+			cfg.fec.payload_min = v;
 			break;
 		}
 		case OPT_STATS:
