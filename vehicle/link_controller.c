@@ -543,6 +543,14 @@ typedef struct {
 		 * txpower dispatch falls back to csa.iface. Set explicitly when
 		 * CSA is disabled. */
 		char     wfb_iface[IFNAMSIZ];
+		/* TX power is owned by the driver's per-rate TXAGC curve
+		 * (rtw_tx_pwr_by_rate=1 + /lib/firmware/PHY_REG_PG.txt on the
+		 * rtl8812eu air unit). When true, the WCMD txpower key is a no-op
+		 * (returns WCMD_STATUS_DISABLED) instead of fork+exec `iw set
+		 * txpower fixed`, which would flatten the curve. Boot value comes
+		 * from wfb-link.json radio.tx_pwr_by_rate via S99wfb --tx-pwr-by-rate;
+		 * live-toggle via /set cmd.tx_pwr_by_rate for bench work. Default off. */
+		bool     tx_pwr_by_rate;
 	} cmd;
 
 	/* ── Recovery backdoor (separate keyless/open -xx link) ──
@@ -2398,6 +2406,23 @@ static int wcmd_dispatch(Config *cfg, const WcmdReq *req,
 	}
 
 	int32_t value = (int32_t)ntohl((uint32_t)req->value);
+
+	/* Per-rate TXAGC handoff: when the driver owns TX power via its per-rate
+	 * curve (cmd.tx_pwr_by_rate — rtl8812eu rtw_tx_pwr_by_rate=1 +
+	 * /lib/firmware/PHY_REG_PG.txt), an `iw set txpower fixed` would flatten
+	 * it. Refuse the key as a no-op BEFORE the clamp/rate-limit so the GS
+	 * always sees a uniform WCMD_STATUS_DISABLED (never OUT_OF_RANGE /
+	 * RATE_LIMITED) rather than the power being applied. */
+	if (key == WCMD_KEY_WFB_TXPOWER && cfg->cmd.tx_pwr_by_rate) {
+		LOG_COMMON("wcmd txpower %d mBm ignored: HW per-rate TXAGC owns "
+		           "txpower (cmd.tx_pwr_by_rate)", value);
+		resp->status    = WCMD_STATUS_DISABLED;
+		st->rejected_disabled++;
+		st->last_status = resp->status;
+		st->last_value  = value;
+		return 0;
+	}
+
 	int clamp_rc  = wcmd_clamp_value(cfg, key, &value);
 	if (clamp_rc < 0) {
 		resp->status = WCMD_STATUS_OUT_OF_RANGE;
@@ -2485,7 +2510,11 @@ static int wcmd_dispatch(Config *cfg, const WcmdReq *req,
 	 * txpower (the radio chip's TX power table is set by the kernel
 	 * driver), so the only way to push it is `iw dev … set txpower fixed`.
 	 * Adaptive MCS does not touch txpower today, so the value sticks
-	 * until the next WCMD or link_controller restart. */
+	 * until the next WCMD or link_controller restart.
+	 *
+	 * (When cmd.tx_pwr_by_rate is set — the driver per-rate TXAGC curve owns
+	 * power — this key is already refused as a no-op before the clamp/
+	 * rate-limit above, so control never reaches the iw fork here.) */
 	if (key == WCMD_KEY_WFB_TXPOWER) {
 		const char *iface = cfg->cmd.wfb_iface[0]
 		    ? cfg->cmd.wfb_iface
@@ -3926,6 +3955,7 @@ static const TunableDesc TUNABLES[] = {
 	{"cmd.wfb_bandwidth_max",SUB_COMMON, TF_INT,  OFF_CMD(wfb_bandwidth_max),5, 80,  "max accepted wfb_tx bandwidth (MHz)"},
 	{"cmd.wfb_txpower_min",  SUB_COMMON, TF_INT,  OFF_CMD(wfb_txpower_min),  1, 4000,"min accepted iw txpower (mBm; 100=1 dBm)"},
 	{"cmd.wfb_txpower_max",  SUB_COMMON, TF_INT,  OFF_CMD(wfb_txpower_max),  1, 4000,"max accepted iw txpower (mBm; 100=1 dBm)"},
+	{"cmd.tx_pwr_by_rate",   SUB_COMMON, TF_BOOL, OFF_CMD(tx_pwr_by_rate),   0, 0,   "driver per-rate TXAGC owns txpower: WCMD txpower key is a no-op (no iw set txpower fixed)"},
 };
 #define TUNABLES_COUNT (sizeof(TUNABLES) / sizeof(TUNABLES[0]))
 
@@ -5776,6 +5806,7 @@ static void config_defaults(Config *c)
 	c->cmd.wfb_txpower_min   = 50;
 	c->cmd.wfb_txpower_max   = 3000;
 	c->cmd.wfb_iface[0]      = '\0';
+	c->cmd.tx_pwr_by_rate    = false;
 
 	/* Recovery backdoor: enabled by default (field-recoverable out of the
 	 * box; disable with --no-recovery for hardened deployments). The hook
@@ -5847,6 +5878,7 @@ int main(int argc, char **argv)
 		OPT_KEY_FILE,
 		/* recovery backdoor (separate keyless/open -xx link) */
 		OPT_NO_RECOVERY, OPT_RECOVERY_PORT, OPT_RECOVERY_CMD, OPT_RECOVERY_ARM_COUNT,
+		OPT_TX_PWR_BY_RATE,
 	};
 	static const struct option longopts[] = {
 		{"wfb",            required_argument, 0, OPT_WFB},
@@ -5869,6 +5901,7 @@ int main(int argc, char **argv)
 		{"probe-feed",     required_argument, 0, OPT_PROBE_FEED},
 		{"csa-iface",      required_argument, 0, OPT_CSA_IFACE},
 		{"wfb-iface",      required_argument, 0, OPT_WFB_IFACE},
+		{"tx-pwr-by-rate", no_argument,       0, OPT_TX_PWR_BY_RATE},
 		{"iface-mtu",      required_argument, 0, OPT_IFACE_MTU},
 		{"log-dir",        required_argument, 0, OPT_LOG_DIR},
 		{"no-log",         no_argument,       0, OPT_NO_LOG},
@@ -6032,6 +6065,9 @@ int main(int argc, char **argv)
 		case OPT_WFB_IFACE:
 			snprintf(cfg.cmd.wfb_iface, sizeof(cfg.cmd.wfb_iface),
 			         "%s", optarg);
+			break;
+		case OPT_TX_PWR_BY_RATE:
+			cfg.cmd.tx_pwr_by_rate = true;
 			break;
 		case OPT_IFACE_MTU: {
 			int m = atoi(optarg);

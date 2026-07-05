@@ -83,6 +83,7 @@ else
     # MUST mirror the defaults in multicall/wfb_configenv.c, which stays
     # authoritative. Standalone is a legacy path — prefer the mega binary.
     : "${WFB_CHANNEL:=161}"  "${WFB_HTMODE:=HT20}"  "${WFB_BW:=20}"  "${WFB_TXPOWER:=2000}"  "${WFB_IFACE:=wlan0}"  "${WFB_MTU:=4052}"
+    : "${WFB_TX_PWR_BY_RATE:=0}"
     : "${KEY:=/etc/drone.key}"  "${WFB_KEY_SEED:=Waybeam}"
     : "${WFB_TX_LINK:=207}"  "${WFB_RX_LINK:=208}"  "${WFB_PROBE_LINK:=50}"  "${WFB_PROBE_PORT:=50}"
     : "${WFB_K:=8}"  "${WFB_N:=12}"  "${WFB_MCS:=2}"  "${WFB_MCS_MIN:=1}"  "${WFB_MCS_MAX:=7}"
@@ -142,7 +143,18 @@ start_wfb() {
     iw dev "$WFB_IFACE" set monitor otherbss >> "$LOG" 2>&1
     ip link set "$WFB_IFACE" up
     iw dev "$WFB_IFACE" set channel $WFB_CHANNEL $WFB_HTMODE >> "$LOG" 2>&1
-    iw dev "$WFB_IFACE" set txpower fixed $WFB_TXPOWER >> "$LOG" 2>&1
+    # TX power: when the driver runs its per-rate TXAGC curve
+    # (radio.tx_pwr_by_rate -> WFB_TX_PWR_BY_RATE; rtl8812eu loaded
+    # rtw_tx_pwr_by_rate=1 + /lib/firmware/PHY_REG_PG.txt), use `auto` so the
+    # hardware applies the per-rate curve. A `fixed` value here flattens it to
+    # one power for all MCS. Otherwise keep the legacy single flat level.
+    case "$WFB_TX_PWR_BY_RATE" in
+        1|true|TRUE|yes)
+            log "txpower: HW per-rate TXAGC curve (iw txpower auto)"
+            iw dev "$WFB_IFACE" set txpower auto              >> "$LOG" 2>&1 ;;
+        *)
+            iw dev "$WFB_IFACE" set txpower fixed $WFB_TXPOWER >> "$LOG" 2>&1 ;;
+    esac
 
     # Raise the monitor-iface MTU. The default 1500 caps wfb_tx injection
     # frames, so any RTP payload above ~1500 (adaptive payload sizing,
@@ -325,6 +337,15 @@ start_wfb() {
                 log "WFB_BITRATE_MIN=$WFB_BITRATE_MIN out of [100,200000]; using daemon default 2200"
             fi ;;
     esac
+    # Per-rate TXAGC handoff: when the rtl8812eu air driver runs its own
+    # per-rate power curve (rtw_tx_pwr_by_rate=1 + /lib/firmware/PHY_REG_PG.txt),
+    # link_controller must NOT push `iw set txpower fixed` on WCMD — that would
+    # flatten the curve. WFB_TX_PWR_BY_RATE comes from wfb-link.json
+    # radio.tx_pwr_by_rate (config-env). Mirrors the S99wfb `iw txpower` gate below.
+    TXPWR_BY_RATE_ARGS=""
+    case "$WFB_TX_PWR_BY_RATE" in
+        1|true|TRUE|yes) TXPWR_BY_RATE_ARGS="--tx-pwr-by-rate" ;;
+    esac
     $LINK_CONTROLLER \
         --wfb 127.0.0.1:$WFB_CTRL \
         --venc "$WFB_VENC_HOST" \
@@ -334,7 +355,7 @@ start_wfb() {
         --failsafe $WFB_FAILSAFE_S \
         --wfb-iface "$WFB_IFACE" \
         --key-file "$KEY" \
-        $PROBE_ARGS $LOG_ARGS $RECOVERY_ARGS $PAYLOAD_ARGS $AIRTIME_ARGS $BITRATE_MIN_ARGS \
+        $PROBE_ARGS $LOG_ARGS $RECOVERY_ARGS $PAYLOAD_ARGS $AIRTIME_ARGS $BITRATE_MIN_ARGS $TXPWR_BY_RATE_ARGS \
         >> "$LOG" 2>&1 &
     echo $! > "$PID_LC"
 

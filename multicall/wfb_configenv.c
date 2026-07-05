@@ -150,6 +150,11 @@ int wfb_configenv_main(int argc, char **argv, int role)
 	ce_str(js, toks, ntok, "radio", "htmode", "HT20", s, sizeof(s)); emit_str("WFB_HTMODE", s);
 	emit_int("WFB_BW",      ce_int(js, toks, ntok, "radio", "bw", 20));
 	emit_int("WFB_TXPOWER", ce_int(js, toks, ntok, "radio", "txpower_mbm", 2000));
+	/* radio.tx_pwr_by_rate (default 0): when 1, the rtl8812eu air driver runs
+	 * its per-rate TXAGC curve (rtw_tx_pwr_by_rate=1 + /lib/firmware/PHY_REG_PG.txt)
+	 * — S99wfb then uses `iw txpower auto` and passes --tx-pwr-by-rate to
+	 * link_controller so WCMD txpower is a no-op instead of flattening the curve. */
+	emit_b01("WFB_TX_PWR_BY_RATE", ce_bool01(js, toks, ntok, "radio", "tx_pwr_by_rate", 0));
 	/* Monitor-iface MTU. Default 4052 = WLAN_DATA_MAXLEN, the rtl88x2eu
 	 * driver's hard max (rtl88x2eu/include/wifi.h). Larger RTP payloads from
 	 * adaptive payload sizing plus wfb_tx/radiotap framing must not exceed the
